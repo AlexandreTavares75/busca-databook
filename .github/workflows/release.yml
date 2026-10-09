@@ -22,7 +22,7 @@ jobs:
     env:
       # SHA-256 do por.traineddata (tessdata_fast 4.1.0). Na 1a execucao deixe vazio:
       # o log mostra o valor; copie-o para ca para travar o arquivo nas proximas.
-      POR_TRAINEDDATA_SHA256: ""
+      POR_TRAINEDDATA_SHA256: "c4932b937207a9514b7514d518b931a99938c02a28a5a5a553f8599ed58b7deb"
       POR_TRAINEDDATA_URL: "https://github.com/tesseract-ocr/tessdata_fast/raw/4.1.0/por.traineddata"
     defaults:
       run:
@@ -56,7 +56,8 @@ jobs:
           python -m pip install -r requirements.txt "pyinstaller>=6,<7"
 
       - name: Gerar ícone
-        run: python tools/gerar_icone.py assets/logo_quadrada.png assets/icone.ico
+        run: 
+          python tools/gerar_icone.py assets/logo_quadrada.png assets/icone.ico
 
       - name: Gerar executável (PyInstaller)
         run: >

@@ -1,0 +1,112 @@
+BUSCA DATABOOK 3.0
+==================
+
+Programa para Windows que procura uma palavra (ex.: "Trafo") dentro dos
+documentos de uma pasta e de todas as suas subpastas: no PC, na rede
+(ex.: \\servidor\projetos ou uma unidade mapeada) ou na nuvem sincronizada
+(OneDrive, Google Drive para computador, SharePoint sincronizado).
+
+
+NOVIDADES DA 3.0
+----------------
+- Instalador para Windows que NÃO precisa de administrador.
+- OCR (Tesseract + Português) já vem dentro do instalador.
+- Atualização automática: o programa avisa quando há versão nova, baixa,
+  confere o código SHA-256 do arquivo e só então instala e reabre sozinho.
+- Menu azul à esquerda com as empresas: cada pasta "DB_NOME" logo dentro
+  da pasta principal vira o botão "NOME". Clicar numa empresa restringe a
+  busca à pasta dela e subpastas. "Todas" busca em tudo.
+- Erros ficam registrados em %LOCALAPPDATA%\BuscaDatabook\erro.log.
+- Login: bloqueio de 30 s após 5 senhas erradas; senhas novas com no
+  mínimo 6 caracteres; troca da própria senha pede a senha atual.
+
+
+INSTALAÇÃO
+----------
+1. Baixe BuscaDatabook-Setup-X.Y.Z.exe na página de Releases:
+   https://github.com/AlexandreTavares75/busca-databook/releases
+2. Dê dois cliques e avance. Instala em
+   %LOCALAPPDATA%\Programs\BuscaDatabook (só para o seu usuário do Windows).
+3. Se o Windows mostrar "O Windows protegeu o computador" (SmartScreen),
+   clique em "Mais informações" > "Executar assim mesmo". Isso acontece
+   porque o instalador ainda não tem assinatura digital de código.
+
+Quem usava a versão 2.x: basta instalar a 3.0. Usuários, senhas e índices
+ficam em %LOCALAPPDATA%\BuscaDatabook e são aproveitados.
+A pasta antiga (dist\BuscaDatabook) pode ser apagada depois.
+
+
+COMO USAR
+---------
+1. No primeiro acesso, crie o usuário administrador. Depois, pelo menu
+   "Usuários", o administrador cadastra os demais.
+2. Clique em "Procurar..." e escolha a pasta principal (a que contém as
+   pastas DB_EMPRESA).
+3. Na primeira vez, o programa lê todos os arquivos e monta um índice.
+   Pode cancelar e continuar depois: o que já foi lido fica salvo.
+4. Escolha a empresa no menu azul (ou "Todas"), digite o termo e tecle Enter.
+5. Duplo clique abre o arquivo. Botão direito: abrir pasta, salvar cópia,
+   copiar caminho.
+6. Quando entrarem arquivos novos, clique em "Atualizar índice".
+   Uma pasta DB_ nova aparece no menu depois de atualizar o índice
+   (ou em Arquivo > Recarregar lista de empresas).
+
+Dicas de busca:
+   trafo               palavras que começam com "trafo"
+   "trafo 500 kva"     frase exata
+   trafo bucha         documentos com as duas palavras
+   trafo OU bucha      documentos com qualquer uma das duas
+
+
+ATUALIZAÇÕES
+------------
+Ao abrir (no máximo uma vez por dia) o programa consulta o GitHub.
+Também dá para verificar em Ajuda > Verificar atualizações, e desligar a
+verificação automática no mesmo menu.
+Segurança: só baixa de endereços do GitHub via HTTPS e só instala se o
+SHA-256 do arquivo baixado for igual ao publicado na release.
+
+
+ONDE FICAM OS DADOS
+-------------------
+%LOCALAPPDATA%\BuscaDatabook\
+   indices\        um índice por pasta principal
+   usuarios.db     usuários e senhas (senhas com hash PBKDF2, nunca em texto)
+   config.json     últimas pastas usadas e preferências
+   erro.log        registro de erros (envie este arquivo ao suporte)
+   atualizacoes\   instalador baixado (apagado na abertura seguinte)
+
+Os usuários são locais de cada computador / usuário do Windows.
+Esqueceu a senha do administrador? Apague o arquivo usuarios.db; no próximo
+acesso o programa pede para criar um novo administrador.
+A desinstalação NÃO apaga esses dados.
+
+
+PARA O DESENVOLVEDOR - PUBLICAR UMA VERSÃO
+------------------------------------------
+1. Altere VERSAO em src\versao.py (ex.: "3.0.1").
+2. git commit -am "versão 3.0.1"
+3. git tag v3.0.1
+4. git push && git push --tags
+O GitHub Actions gera o .exe, o instalador e o .sha256 e publica a
+release. Os programas instalados recebem a atualização sozinhos.
+A tag precisa ser igual à VERSAO, senão o build para com erro.
+
+Rodar pelo código-fonte (testes): executar_sem_exe.bat
+Gerar o instalador no próprio PC: build_local.bat
+
+
+LIMITES ATUAIS
+--------------
+- Arquivos acima de 300 MB são indexados só pelo nome.
+- .doc antigos: com o Microsoft Word instalado, o texto é lido pelo Word;
+  sem ele, a leitura é aproximada.
+- .ppt antigo (97-2003) é buscado só pelo nome.
+- Nuvem que não está sincronizada no PC (acessada só pelo navegador)
+  não é lida.
+- Por enquanto todos os usuários veem todas as empresas.
+
+
+LICENÇAS DE TERCEIROS
+---------------------
+Tesseract OCR - Apache License 2.0 - https://github.com/tesseract-ocr/tesseract

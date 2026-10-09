@@ -18,6 +18,7 @@ import tempfile
 import threading
 import time
 import zipfile
+from pathlib import Path
 import tkinter as tk
 from logging.handlers import RotatingFileHandler
 from tkinter import ttk, filedialog, messagebox, simpledialog
@@ -36,12 +37,36 @@ TENTATIVAS_LOGIN = 5
 BLOQUEIO_LOGIN_S = 30
 
 # Menu lateral
+LARGURA_MENU = 220
 AZUL = "#002060"
-AZUL_HOVER = "#0E3A8A"
 AZUL_TEXTO_SUAVE = "#AFC3E8"
+BOTAO_COR = "#0B3A8C"            # botao em relevo, um tom acima do fundo
+BOTAO_HOVER = "#1A4FA8"
 FONTE_MENU = ("Segoe UI", 10)
 FONTE_MENU_SEL = ("Segoe UI", 10, "bold")
+EMPRESA_DEV = "Omni Solutions Ltda"
 
+
+def caminho_recurso(*partes) -> Path:
+    """Arquivos embutidos (ex.: logo): no .exe ficam em _MEIPASS; no codigo-fonte, na raiz do projeto."""
+    base = getattr(sys, "_MEIPASS", None) or Path(__file__).resolve().parent.parent
+    return Path(base).joinpath(*partes)
+
+
+def carregar_logo(largura_max, altura_max):
+    """Carrega assets/logo.png, corta as bordas transparentes e reduz. None se falhar."""
+    try:
+        from PIL import Image, ImageTk
+        img = Image.open(caminho_recurso("assets", "logo.png")).convert("RGBA")
+        caixa = img.getchannel("A").getbbox()
+        if caixa:
+            img = img.crop(caixa)
+        img.thumbnail((largura_max, altura_max), getattr(Image, "Resampling", Image).LANCZOS)
+        return ImageTk.PhotoImage(img)
+    except Exception:
+        log.warning("Logomarca não carregada", exc_info=True)
+        return None
+    
 FILTROS = {
     "Todos os tipos": None,
     "PDF": {"pdf"},
@@ -346,20 +371,21 @@ class TelaUsuarios(tk.Toplevel):
 # --------------------------------------------------------------------------
 
 class MenuEmpresas(tk.Frame):
-    """Barra azul a esquerda: "Todas" + um botao por pasta DB_NOME."""
+    """Barra azul a esquerda: "Todas" + um botao por pasta DB_NOME + logomarca no rodape."""
 
     def __init__(self, master, ao_escolher):
-        super().__init__(master, bg=AZUL, width=210)
+        super().__init__(master, bg=AZUL, width=LARGURA_MENU)
         self.pack_propagate(False)
         self.ao_escolher = ao_escolher
         self.botoes = {}            # caminho (ou None para "Todas") -> Label
         self.selecionado = None
 
         tk.Label(self, text="EMPRESAS", bg=AZUL, fg=AZUL_TEXTO_SUAVE, anchor="w",
-                 font=("Segoe UI", 9, "bold"), padx=16, pady=14).pack(fill="x")
+                 font=("Segoe UI", 9, "bold"), padx=16, pady=14).pack(side="top", fill="x")
+        self._montar_rodape()       # antes da lista: side="bottom" mantem o rodape fixo
 
         area = tk.Frame(self, bg=AZUL)
-        area.pack(fill="both", expand=True)
+        area.pack(side="top", fill="both", expand=True)
         self.canvas = tk.Canvas(area, bg=AZUL, highlightthickness=0, bd=0)
         self.barra = ttk.Scrollbar(area, orient="vertical", command=self.canvas.yview)
         self.canvas.configure(yscrollcommand=self.barra.set)
@@ -370,6 +396,19 @@ class MenuEmpresas(tk.Frame):
         self.canvas.bind("<Configure>", lambda e: (self.canvas.itemconfigure(self._janela, width=e.width),
                                                    self._ajustar_rolagem()))
         self.bind_all("<MouseWheel>", self._roda_mouse, add="+")
+
+    def _montar_rodape(self):
+        rodape = tk.Frame(self, bg=AZUL)
+        rodape.pack(side="bottom", fill="x", pady=(6, 14))
+        tk.Frame(rodape, bg=BOTAO_COR, height=1).pack(fill="x", padx=12, pady=(0, 10))
+        tk.Label(rodape, text="Desenvolvido por:", bg=AZUL, fg=AZUL_TEXTO_SUAVE,
+                 font=("Segoe UI", 8)).pack()
+        self._logo = carregar_logo(LARGURA_MENU - 40, 90)   # referencia mantida (senao o Tk descarta)
+        if self._logo:
+            tk.Label(rodape, image=self._logo, bg=AZUL).pack(pady=(6, 0))
+        else:
+            tk.Label(rodape, text=EMPRESA_DEV, bg=AZUL, fg="white",
+                     font=("Segoe UI", 9, "bold")).pack(pady=(4, 0))
 
     def _ajustar_rolagem(self):
         self.canvas.configure(scrollregion=self.canvas.bbox("all"))
@@ -397,7 +436,7 @@ class MenuEmpresas(tk.Frame):
             w.destroy()
         self.botoes.clear()
         self._botao("Todas", None, None)
-        tk.Frame(self.lista, bg=AZUL_HOVER, height=1).pack(fill="x", padx=12, pady=6)
+        tk.Frame(self.lista, bg=BOTAO_COR, height=1).pack(fill="x", padx=12, pady=6)
         if not empresas:
             tk.Label(self.lista, text='Nenhuma pasta "DB_..."\nna pasta principal.', bg=AZUL,
                      fg=AZUL_TEXTO_SUAVE, justify="left", anchor="w", padx=16,
@@ -407,32 +446,44 @@ class MenuEmpresas(tk.Frame):
         self.marcar(None)
 
     def _botao(self, texto, chave, nome):
-        b = tk.Label(self.lista, text=texto, bg=AZUL, fg="white", anchor="w", padx=16, pady=7,
-                     font=FONTE_MENU, cursor="hand2", takefocus=1,
+        b = tk.Label(self.lista, text=texto, bg=BOTAO_COR, fg="white", anchor="w", justify="left",
+                     padx=12, pady=6, font=FONTE_MENU, cursor="hand2", takefocus=1,
+                     relief="raised", bd=2, wraplength=LARGURA_MENU - 50,
                      highlightthickness=1, highlightbackground=AZUL, highlightcolor="white")
-        b.pack(fill="x")
-        acionar = lambda e=None: self._clicar(chave, nome)
-        b.bind("<Button-1>", acionar)
-        b.bind("<Return>", acionar)
-        b.bind("<space>", acionar)
-        b.bind("<Enter>", lambda e: chave != self.selecionado and b.config(bg=AZUL_HOVER))
-        b.bind("<Leave>", lambda e: chave != self.selecionado and b.config(bg=AZUL))
+        b.pack(fill="x", padx=10, pady=3)
+
+        def soltar(e):
+            # como um botao de verdade: so aciona se soltar o clique em cima dele
+            if 0 <= e.x < b.winfo_width() and 0 <= e.y < b.winfo_height():
+                self._clicar(chave, nome)
+            else:
+                self._pintar(chave, b)
+
+        b.bind("<ButtonPress-1>", lambda e: b.config(relief="sunken"))
+        b.bind("<ButtonRelease-1>", soltar)
+        b.bind("<Return>", lambda e: self._clicar(chave, nome))
+        b.bind("<space>", lambda e: self._clicar(chave, nome))
+        b.bind("<Enter>", lambda e: chave != self.selecionado and b.config(bg=BOTAO_HOVER))
+        b.bind("<Leave>", lambda e: self._pintar(chave, b))
         self.botoes[chave] = b
+
+    def _pintar(self, chave, b):
+        if chave == self.selecionado:
+            b.config(bg="white", fg=AZUL, font=FONTE_MENU_SEL, relief="sunken")
+        else:
+            b.config(bg=BOTAO_COR, fg="white", font=FONTE_MENU, relief="raised")
 
     def _clicar(self, chave, nome):
         self.marcar(chave)
         self.ao_escolher(chave, nome)
 
     def marcar(self, chave):
-        """Destaca o botao selecionado (fundo branco, texto azul)."""
+        """Selecionado: branco e 'afundado'. Demais: azul em relevo."""
         if chave not in self.botoes:
             chave = None
         self.selecionado = chave
         for k, b in self.botoes.items():
-            if k == chave:
-                b.config(bg="white", fg=AZUL, font=FONTE_MENU_SEL)
-            else:
-                b.config(bg=AZUL, fg="white", font=FONTE_MENU)
+            self._pintar(k, b)
 
 
 # --------------------------------------------------------------------------

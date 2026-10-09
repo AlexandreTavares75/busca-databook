@@ -59,7 +59,7 @@ jobs:
         run: >
           python -m PyInstaller --noconfirm --clean --windowed --name BuscaDatabook
           --paths src --collect-all pypdfium2 --collect-all docx --collect-all pptx
-          --hidden-import win32com.client src/app.py
+          --hidden-import win32com.client --add-data "assets/logo.png;assets" src/app.py
 
       - name: Preparar Tesseract OCR + Português
         run: |

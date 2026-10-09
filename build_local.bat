@@ -16,8 +16,8 @@ echo [1/3] Bibliotecas e executavel...
 python -m pip install -r requirements.txt "pyinstaller>=6,<7" || goto erro
 python -m PyInstaller --noconfirm --clean --windowed --name BuscaDatabook --paths src ^
   --collect-all pypdfium2 --collect-all docx --collect-all pptx ^
-  --hidden-import win32com.client src\app.py || goto erro
-
+  --hidden-import win32com.client --add-data "assets\logo.png;assets" src\app.py || goto erro
+  
 echo.
 echo [2/3] Copiando o Tesseract...
 if not exist "C:\Program Files\Tesseract-OCR\tessdata\por.traineddata" (

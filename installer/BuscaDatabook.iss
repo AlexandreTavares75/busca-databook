@@ -38,6 +38,7 @@ OutputBaseFilename=BuscaDatabook-Setup-{#AppVersion}
 Compression=lzma2/max
 SolidCompression=yes
 WizardStyle=modern
+SetupIconFile=..\assets\icone.ico
 UninstallDisplayIcon={app}\{#AppExe}
 UninstallDisplayName={#AppName}
 SetupLogging=yes

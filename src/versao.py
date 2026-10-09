@@ -7,5 +7,5 @@ O GitHub Actions confere se a tag bate com este arquivo antes de gerar o instala
 """
 
 APP_NOME = "Busca Databook"
-VERSAO = "3.0.1"
+VERSAO = "3.0.2"
 REPO_GITHUB = "AlexandreTavares75/busca-databook"

@@ -14,9 +14,11 @@ echo Versao: %VERSAO%
 echo.
 echo [1/3] Bibliotecas e executavel...
 python -m pip install -r requirements.txt "pyinstaller>=6,<7" || goto erro
+python tools\gerar_icone.py assets\logo_quadrada.png assets\icone.ico || goto erro
 python -m PyInstaller --noconfirm --clean --windowed --name BuscaDatabook --paths src ^
   --collect-all pypdfium2 --collect-all docx --collect-all pptx ^
-  --hidden-import win32com.client --add-data "assets\logo.png;assets" src\app.py || goto erro
+  --hidden-import win32com.client --icon assets\icone.ico ^
+  --add-data "assets\logo.png;assets" --add-data "assets\icone.ico;assets" src\app.py || goto erro
   
 echo.
 echo [2/3] Copiando o Tesseract...

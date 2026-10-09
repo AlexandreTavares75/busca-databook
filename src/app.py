@@ -66,6 +66,15 @@ def carregar_logo(largura_max, altura_max):
     except Exception:
         log.warning("Logomarca não carregada", exc_info=True)
         return None
+
+def aplicar_icone(janela):
+    """Icone da barra de titulo e da barra de tarefas (vale para todas as janelas do app)."""
+    ico = caminho_recurso("assets", "icone.ico")
+    if sys.platform.startswith("win") and ico.is_file():
+        try:
+            janela.iconbitmap(default=str(ico))
+        except tk.TclError:
+            log.debug("Ícone não aplicado", exc_info=True)
     
 FILTROS = {
     "Todos os tipos": None,
@@ -1133,6 +1142,7 @@ def main():
             pass
     root = tk.Tk()
     root.withdraw()
+    aplicar_icone(root)
     # sem console no .exe: erros de callback vao para o erro.log (a App substitui depois)
     root.report_callback_exception = lambda t, v, tb: log.error("Erro na interface", exc_info=(t, v, tb))
     try:

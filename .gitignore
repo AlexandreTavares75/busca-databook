@@ -6,3 +6,5 @@ output/
 vendor/
 *.spec
 .venv/
+assets/icone.ico
+assets/icone_preview.png

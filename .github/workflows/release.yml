@@ -55,7 +55,7 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install -r requirements.txt "pyinstaller>=6,<7"
 
-            - name: Gerar ícone
+      - name: Gerar ícone
         run: python tools/gerar_icone.py assets/logo_quadrada.png assets/icone.ico
 
       - name: Gerar executável (PyInstaller)

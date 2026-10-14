@@ -12,6 +12,7 @@ import io
 import logging
 import os
 import re
+import shutil
 import sqlite3
 import sys
 import threading
@@ -44,6 +45,18 @@ SEP_ZIP = " >> "              # separador entre o zip e o arquivo interno
 
 PREFIXO_EMPRESA = "DB_"       # pastas "DB_NOME" na pasta principal viram empresas
 SENHA_MIN = 6                 # vale para senhas novas; senhas antigas continuam aceitas
+
+FORMATO_EXPORTACAO = "buscadatabook-indice/1"
+EXT_EXPORTACAO = ".bdx"
+
+# Atributos de arquivo do Windows usados pelo OneDrive (Arquivos sob demanda)
+_ATR_OFFLINE = 0x1000
+_ATR_RECALL_ON_OPEN = 0x40000
+_ATR_PINNED = 0x80000                  # "Sempre manter neste dispositivo"
+_ATR_UNPINNED = 0x100000               # "Liberar espaco"
+_ATR_RECALL_ON_DATA_ACCESS = 0x400000
+_ATR_NUVEM = _ATR_OFFLINE | _ATR_RECALL_ON_OPEN | _ATR_RECALL_ON_DATA_ACCESS
+_ATR_GRAVAVEIS = 0x1 | 0x2 | 0x4 | 0x20 | 0x100 | 0x2000   # somente leitura, oculto, sistema...
 
 
 def pasta_dados_app() -> Path:
@@ -320,6 +333,36 @@ def _corrigir_nome_zip(info):
 
 
 # --------------------------------------------------------------------------
+# OneDrive: economia de espaco
+# --------------------------------------------------------------------------
+
+def so_na_nuvem(st) -> bool:
+    """True se o arquivo esta so na nuvem (OneDrive sob demanda): le-lo dispara o download."""
+    atr = getattr(st, "st_file_attributes", 0)
+    return bool(atr & _ATR_NUVEM) and not (atr & _ATR_PINNED)
+
+
+def liberar_espaco(caminho) -> bool:
+    """Devolve o arquivo a nuvem, como o "Liberar espaco" do Explorador (attrib +U -P)."""
+    if os.name != "nt":
+        return False
+    try:
+        import ctypes
+        k32 = ctypes.windll.kernel32
+        k32.GetFileAttributesW.argtypes = [ctypes.c_wchar_p]
+        k32.GetFileAttributesW.restype = ctypes.c_uint32
+        k32.SetFileAttributesW.argtypes = [ctypes.c_wchar_p, ctypes.c_uint32]
+        k32.SetFileAttributesW.restype = ctypes.c_int
+        atr = k32.GetFileAttributesW(str(caminho))
+        if atr == 0xFFFFFFFF:
+            return False
+        return bool(k32.SetFileAttributesW(str(caminho), (atr & _ATR_GRAVAVEIS) | _ATR_UNPINNED))
+    except Exception:
+        log.debug("Não foi possível liberar espaço de %s", caminho, exc_info=True)
+        return False
+
+
+# --------------------------------------------------------------------------
 # Empresas (pastas DB_NOME)
 # --------------------------------------------------------------------------
 
@@ -401,10 +444,53 @@ class Indice:
 
     # ---- atualizacao incremental ----------------------------------------
 
-    def atualizar(self, usar_ocr=True, progresso=None, cancelado=lambda: False):
+    def _varrer(self, cancelado, avisar):
+        """
+        Lista os arquivos da pasta principal (e subpastas) sem abrir nenhum deles:
+        nao dispara download do OneDrive. Devolve (no_disco, nuvem, falhas):
+          no_disco: {caminho: (mtime, tamanho)}
+          nuvem:    caminhos que estao so na nuvem
+          falhas:   quantas pastas/arquivos nao puderam ser listados (rede, permissao...)
+        """
+        no_disco, nuvem, falhas = {}, set(), 0
+        pilha = [self.raiz]
+        while pilha:
+            if cancelado():
+                break
+            pasta = pilha.pop()
+            try:
+                with os.scandir(pasta) as it:
+                    entradas = list(it)
+            except OSError:
+                falhas += 1
+                log.warning("Pasta inacessível durante a listagem: %s", pasta)
+                continue
+            subpastas = []
+            for e in entradas:
+                nome = e.name
+                try:
+                    if e.is_dir(follow_symlinks=False):
+                        if not nome.startswith(("~", "$", ".")):   # ignora pastas ocultas/sistema
+                            subpastas.append(e.path)
+                        continue
+                    if nome.startswith("~$"):                       # temporario do Office
+                        continue
+                    st = e.stat(follow_symlinks=False)
+                except OSError:
+                    falhas += 1
+                    continue
+                no_disco[e.path] = (st.st_mtime, st.st_size)
+                if so_na_nuvem(st):
+                    nuvem.add(e.path)
+            pilha.extend(sorted(subpastas, key=str.casefold, reverse=True))  # ordem alfabetica
+            avisar(f"Listando arquivos... {len(no_disco)}")
+        return no_disco, nuvem, falhas
+
+    def atualizar(self, usar_ocr=True, progresso=None, cancelado=lambda: False, liberar_nuvem=True):
         """
         Varre a pasta e (re)indexa so o que mudou.
         progresso(msg, atual, total) e chamado periodicamente.
+        liberar_nuvem: arquivos que estavam so no OneDrive voltam para a nuvem depois de lidos.
         Devolve dict com contagens.
         """
         def avisar(msg, i=0, n=0):
@@ -412,38 +498,26 @@ class Indice:
                 progresso(msg, i, n)
 
         avisar("Listando arquivos...")
-        no_disco = {}
-        for dirpath, dirnames, filenames in os.walk(self.raiz, onerror=lambda e: None):
-            if cancelado():
-                break
-            # ignora pastas ocultas/sistema
-            dirnames[:] = [d for d in dirnames if not d.startswith(("~", "$", "."))]
-            for f in filenames:
-                if f.startswith("~$"):  # arquivo temporario do Office
-                    continue
-                p = os.path.join(dirpath, f)
-                try:
-                    st = os.stat(p)
-                    no_disco[p] = (st.st_mtime, st.st_size)
-                except OSError:
-                    pass
-            avisar(f"Listando arquivos... {len(no_disco)}")
+        no_disco, nuvem, falhas = self._varrer(cancelado, avisar)
 
         if cancelado():
             # varredura incompleta: nao remove nada do indice com base nela
-            return {"total": len(no_disco), "lidos": 0, "removidos": 0, "erros": 0, "cancelado": True}
+            return {"total": len(no_disco), "lidos": 0, "removidos": 0, "erros": 0,
+                    "liberados": 0, "falhas": falhas, "cancelado": True}
 
         no_indice = {r[0]: (r[1], r[2]) for r in
                      self.con.execute("SELECT caminho, mtime, tamanho FROM arquivos")}
 
-        removidos = [p for p in no_indice if p not in no_disco]
-        novos = [p for p, mt in no_disco.items() if no_indice.get(p) != mt]
+        # Se alguma pasta nao pode ser lida (rede/VPN instavel), nao remove nada:
+        # um arquivo "sumido" pode estar apenas inacessivel naquele momento.
+        removidos = [] if falhas else [p for p in no_indice if p not in no_disco]
+        novos = [p for p, mt in no_disco.items() if _mudou(no_indice.get(p), mt)]
 
         for p in removidos:
             self._remover(p)
         self.con.commit()
 
-        erros = 0
+        erros = liberados = 0
         total = len(novos)
         t_commit = time.time()
         for i, p in enumerate(novos, 1):
@@ -453,6 +527,8 @@ class Indice:
             avisar(f"Lendo {nome}", i, total)
             mtime, tam = no_disco[p]
             status = "ok"
+            leu_conteudo = (tam <= MAX_TAMANHO_MB * 1024 * 1024
+                            and os.path.splitext(nome)[1].lower() in EXT_CONTEUDO)
             try:
                 if tam > MAX_TAMANHO_MB * 1024 * 1024:
                     partes = [("", "")]
@@ -464,6 +540,9 @@ class Indice:
                 partes = [("", "")]
                 status = f"erro: {type(e).__name__}: {e}"[:300]
                 erros += 1
+            # so devolve a nuvem o que estava na nuvem antes e foi baixado para leitura
+            if liberar_nuvem and leu_conteudo and p in nuvem and liberar_espaco(p):
+                liberados += 1
             self._remover(p)
             nome_busca = _nome_pesquisavel(p, self.raiz)
             for interno, texto in partes:
@@ -480,7 +559,12 @@ class Indice:
                          (time.strftime("%d/%m/%Y %H:%M"),))
         self.con.commit()
         return {"total": len(no_disco), "lidos": total, "removidos": len(removidos),
-                "erros": erros, "cancelado": cancelado()}
+                "erros": erros, "liberados": liberados, "falhas": falhas, "cancelado": cancelado()}
+
+    def contem(self, caminho) -> bool:
+        """True se o caminho esta dentro da pasta principal deste indice."""
+        raiz = os.path.normcase(os.path.join(self.raiz, ""))
+        return os.path.normcase(os.path.abspath(caminho)).startswith(raiz)
 
     def _remover(self, p):
         self.con.execute("DELETE FROM conteudo WHERE caminho = ?", (p,))
@@ -514,7 +598,7 @@ class Indice:
           trafo bucha      -> documentos com as duas palavras
           trafo OU bucha   -> qualquer uma das palavras
         pasta: se informada, restringe a busca a essa pasta e subpastas (ex.: uma empresa).
-        Devolve lista de dicts: caminho, interno, nome, pasta, ext, trecho, onde.
+        Devolve lista de dicts: caminho, interno, nome, pasta, ext, trecho, onde, mtime, tamanho.
         """
         consulta = montar_consulta(termo)
         if not consulta:
@@ -553,7 +637,216 @@ class Indice:
                 "trecho": _limpar(trecho if achou_no_texto else trecho_nome),
                 "onde": "conteúdo" if achou_no_texto else "nome",
             })
+        meta = self._meta_arquivos(r["caminho"] for r in resultados)
+        for r in resultados:
+            r["mtime"], r["tamanho"] = meta.get(r["caminho"], (0.0, 0))
         return resultados
+
+    def _meta_arquivos(self, caminhos):
+        """{caminho: (mtime, tamanho)} - consulta em lotes (limite de parametros do SQLite)."""
+        meta, lista = {}, list(set(caminhos))
+        for i in range(0, len(lista), 500):
+            parte = lista[i:i + 500]
+            marcas = ",".join("?" * len(parte))
+            for c, mt, tam in self.con.execute(
+                    f"SELECT caminho, mtime, tamanho FROM arquivos WHERE caminho IN ({marcas})", parte):
+                meta[c] = (mt or 0.0, tam or 0)
+        return meta
+
+    # ---- exportar / importar ----------------------------------------------
+
+    def _filtro_exportacao(self, pastas, incluir_fora):
+        """WHERE para exportar so algumas empresas. pastas=None exporta o indice inteiro."""
+        if pastas is None:
+            return "1", []
+        conds, params = [], []
+        for p in pastas:
+            pref = self._prefixo_seguro(p)
+            conds.append("substr(caminho, 1, ?) = ?")
+            params += [len(pref), pref]
+        if incluir_fora:   # arquivos que nao estao em nenhuma pasta DB_
+            todas = [self._prefixo_seguro(c) for _, c in self.empresas()]
+            if todas:
+                conds.append("(" + " AND ".join("substr(caminho, 1, ?) <> ?" for _ in todas) + ")")
+                for t in todas:
+                    params += [len(t), t]
+            else:
+                conds.append("1")
+        if not conds:
+            raise ValueError("Escolha ao menos uma empresa para exportar.")
+        return "(" + " OR ".join(conds) + ")", params
+
+    def exportar(self, destino, pastas=None, incluir_fora=True):
+        """
+        Gera um arquivo .bdx (SQLite) com o indice inteiro ou so das empresas escolhidas.
+        Devolve quantos arquivos foram exportados.
+        """
+        destino = Path(destino)
+        tmp = destino.with_name(destino.name + ".tmp")
+        if tmp.exists():
+            tmp.unlink()
+        filtro, params = self._filtro_exportacao(pastas, incluir_fora)
+        con = sqlite3.connect(str(tmp))
+        try:
+            con.executescript(ESQUEMA)
+            con.execute("ATTACH DATABASE ? AS origem", (str(self.db_path),))
+            con.execute(f"INSERT INTO arquivos SELECT caminho, mtime, tamanho, status "
+                        f"FROM origem.arquivos WHERE {filtro}", params)
+            con.execute(f"INSERT INTO conteudo (caminho, interno, nome, texto) "
+                        f"SELECT caminho, interno, nome, texto FROM origem.conteudo WHERE {filtro}", params)
+            r = con.execute("SELECT valor FROM origem.meta WHERE chave='atualizado'").fetchall()
+            con.executemany("INSERT OR REPLACE INTO meta VALUES (?, ?)", [
+                ("raiz", self.raiz),
+                ("formato", FORMATO_EXPORTACAO),
+                ("exportado_em", time.strftime("%d/%m/%Y %H:%M")),
+                ("atualizado", r[0][0] if r else ""),
+            ])
+            con.commit()
+            n = con.execute("SELECT COUNT(*) FROM arquivos").fetchall()[0][0]
+            con.execute("DETACH DATABASE origem")
+        except Exception:
+            con.close()
+            tmp.unlink(missing_ok=True)
+            raise
+        con.close()
+        os.replace(tmp, destino)
+        log.info("Índice exportado: %s (%d arquivos)", destino, n)
+        return n
+
+    def mesclar(self, arquivo):
+        """Junta um indice (ja com os caminhos desta pasta) ao indice atual.
+        Arquivos que ja existiam sao substituidos; os demais sao mantidos."""
+        self.con.commit()
+        self.con.execute("ATTACH DATABASE ? AS imp", (str(arquivo),))
+        try:
+            with self.con:
+                self.con.execute("DELETE FROM conteudo WHERE caminho IN (SELECT caminho FROM imp.arquivos)")
+                self.con.execute("DELETE FROM arquivos WHERE caminho IN (SELECT caminho FROM imp.arquivos)")
+                self.con.execute("INSERT INTO arquivos SELECT caminho, mtime, tamanho, status FROM imp.arquivos")
+                self.con.execute("INSERT INTO conteudo (caminho, interno, nome, texto) "
+                                 "SELECT caminho, interno, nome, texto FROM imp.conteudo")
+                r = self.con.execute("SELECT valor FROM imp.meta WHERE chave='atualizado'").fetchall()
+                if r and r[0][0]:
+                    self.con.execute("INSERT OR REPLACE INTO meta VALUES ('atualizado', ?)", (r[0][0],))
+            n = self.con.execute("SELECT COUNT(*) FROM imp.arquivos").fetchall()[0][0]
+        finally:
+            self.con.execute("DETACH DATABASE imp")
+        return n
+
+
+def ler_exportacao(arquivo):
+    """Le e valida o cabecalho de um indice exportado. Devolve dict(raiz, arquivos, exportado_em)."""
+    try:
+        con = sqlite3.connect(str(arquivo))
+    except sqlite3.Error as e:
+        raise ValueError(f"Não foi possível abrir o arquivo: {e}")
+    try:
+        con.execute("PRAGMA query_only = 1")
+        meta = dict(con.execute("SELECT chave, valor FROM meta").fetchall())
+        if meta.get("formato") != FORMATO_EXPORTACAO:
+            raise ValueError("Este arquivo não é um índice exportado pelo Busca Databook.")
+        n = con.execute("SELECT COUNT(*) FROM arquivos").fetchone()[0]
+    except sqlite3.DatabaseError as e:
+        raise ValueError(f"Arquivo de índice inválido ou corrompido: {e}")
+    finally:
+        con.close()
+    return {"raiz": meta.get("raiz", ""), "arquivos": n, "exportado_em": meta.get("exportado_em", "")}
+
+
+def importar_indice(arquivo, nova_raiz):
+    """
+    Importa um .bdx para a pasta principal nova_raiz (pode ser outro caminho que o de origem:
+    os caminhos sao ajustados). Junta ao indice existente dessa pasta. Devolve quantos arquivos.
+    """
+    info = ler_exportacao(arquivo)
+    idx = Indice(nova_raiz)
+    tmp = pasta_dados_app() / "indices" / f"importando-{os.getpid()}-{int(time.time())}.db"
+    try:
+        shutil.copyfile(arquivo, tmp)   # trabalha numa copia: o arquivo recebido fica intacto
+        con = sqlite3.connect(str(tmp))
+        try:
+            if con.execute("PRAGMA quick_check").fetchone()[0] != "ok":
+                raise ValueError("O arquivo de índice está corrompido.")
+            p_ant = os.path.join(info["raiz"], "")
+            p_nova = os.path.join(idx.raiz, "")
+            if p_ant != p_nova:
+                for tabela in ("arquivos", "conteudo"):
+                    con.execute(f"UPDATE {tabela} SET caminho = ? || substr(caminho, ?) "
+                                f"WHERE substr(caminho, 1, ?) = ?",
+                                (p_nova, len(p_ant) + 1, len(p_ant), p_ant))
+            # seguranca: nenhum caminho pode apontar para fora da pasta escolhida
+            fora = sum(con.execute(f"SELECT COUNT(*) FROM {t} WHERE substr(caminho, 1, ?) <> ?",
+                                   (len(p_nova), p_nova)).fetchone()[0] for t in ("arquivos", "conteudo"))
+            if fora:
+                raise ValueError("O índice contém caminhos fora da pasta escolhida. Importação cancelada.")
+            con.commit()
+        finally:
+            con.close()
+        n = idx.mesclar(tmp)
+        log.info("Índice importado de %s para %s (%d arquivos)", arquivo, idx.raiz, n)
+        return n
+    finally:
+        idx.fechar()
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+
+
+# --------------------------------------------------------------------------
+# Copias e versoes repetidas nos resultados
+# --------------------------------------------------------------------------
+
+def _mudou(no_indice, no_disco) -> bool:
+    """Compara (mtime, tamanho) com tolerancia de 1 ms na data."""
+    if no_indice is None:
+        return True
+    return no_indice[1] != no_disco[1] or abs((no_indice[0] or 0) - no_disco[0]) > 0.001
+
+
+def _nome_documento(r) -> str:
+    """Nome do documento (para zip: nome do arquivo interno)."""
+    if r["interno"]:
+        ultimo = r["interno"].split(SEP_ZIP)[-1]
+        return ultimo.replace("\\", "/").rsplit("/", 1)[-1]
+    return r["nome"]
+
+
+def _empresa_do_caminho(caminho, prefixo_raiz) -> str:
+    """Pasta DB_ de primeiro nivel onde o arquivo esta ("" se nao estiver em nenhuma)."""
+    if not os.path.normcase(caminho).startswith(os.path.normcase(prefixo_raiz)):
+        return ""
+    primeira = re.split(r"[\\/]", caminho[len(prefixo_raiz):], maxsplit=1)[0]
+    return primeira.casefold() if primeira.upper().startswith(PREFIXO_EMPRESA) else ""
+
+
+def agrupar_repetidos(resultados, raiz):
+    """
+    Junta documentos com o mesmo nome dentro da mesma empresa e mostra so um:
+      - versoes (tamanhos diferentes): fica a mais recente;
+      - copias identicas (mesmo tamanho): fica a do caminho mais curto.
+    Cada item devolvido traz em "copias" todos os documentos do grupo (mais recente primeiro).
+    A ordem de relevancia da busca e mantida.
+    """
+    prefixo = os.path.join(raiz, "")
+    grupos, ordem = {}, []
+    for r in resultados:
+        chave = (_empresa_do_caminho(r["caminho"], prefixo), _nome_documento(r).casefold())
+        if chave not in grupos:
+            grupos[chave] = []
+            ordem.append(chave)
+        grupos[chave].append(r)
+    saida = []
+    for chave in ordem:
+        membros = grupos[chave]
+        versoes = {}
+        for r in membros:
+            versoes.setdefault(r.get("tamanho", 0), []).append(r)
+        recente = max(versoes.values(), key=lambda v: max(x.get("mtime", 0) for x in v))
+        principal = dict(min(recente, key=lambda x: (len(x["caminho"]) + len(x["interno"]), x["caminho"])))
+        principal["copias"] = sorted(membros, key=lambda x: (-x.get("mtime", 0), len(x["caminho"])))
+        saida.append(principal)
+    return saida
 
 
 def _nome_pesquisavel(caminho, raiz):

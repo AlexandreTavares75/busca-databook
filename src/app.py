@@ -46,36 +46,6 @@ FONTE_MENU = ("Segoe UI", 10)
 FONTE_MENU_SEL = ("Segoe UI", 10, "bold")
 EMPRESA_DEV = "Omni Solutions Ltda"
 
-
-def caminho_recurso(*partes) -> Path:
-    """Arquivos embutidos (ex.: logo): no .exe ficam em _MEIPASS; no codigo-fonte, na raiz do projeto."""
-    base = getattr(sys, "_MEIPASS", None) or Path(__file__).resolve().parent.parent
-    return Path(base).joinpath(*partes)
-
-
-def carregar_logo(largura_max, altura_max):
-    """Carrega assets/logo.png, corta as bordas transparentes e reduz. None se falhar."""
-    try:
-        from PIL import Image, ImageTk
-        img = Image.open(caminho_recurso("assets", "logo.png")).convert("RGBA")
-        caixa = img.getchannel("A").getbbox()
-        if caixa:
-            img = img.crop(caixa)
-        img.thumbnail((largura_max, altura_max), getattr(Image, "Resampling", Image).LANCZOS)
-        return ImageTk.PhotoImage(img)
-    except Exception:
-        log.warning("Logomarca não carregada", exc_info=True)
-        return None
-
-def aplicar_icone(janela):
-    """Icone da barra de titulo e da barra de tarefas (vale para todas as janelas do app)."""
-    ico = caminho_recurso("assets", "icone.ico")
-    if sys.platform.startswith("win") and ico.is_file():
-        try:
-            janela.iconbitmap(default=str(ico))
-        except tk.TclError:
-            log.debug("Ícone não aplicado", exc_info=True)
-    
 FILTROS = {
     "Todos os tipos": None,
     "PDF": {"pdf"},
@@ -105,20 +75,28 @@ Empresas
 - Clique numa empresa para buscar só na pasta dela (e subpastas).
 - "Todas" busca na pasta principal inteira.
 
+Cópias e versões
+- Documentos com o mesmo nome na mesma empresa aparecem uma vez só:
+  a versão mais recente, no caminho mais curto.
+- A coluna "Cópias" mostra quantos existem. Botão direito >
+  "Ver todas as cópias e versões" lista todos.
+- Desmarque "Ocultar cópias e versões antigas" para ver tudo.
+
 O que é lido
 - Conteúdo: Word, Excel, PowerPoint, PDF (inclusive escaneado, por OCR),
   textos, e arquivos dentro de .zip.
 - Só o nome: imagens (PNG, JPEG...), MPP, DWG, DWF e demais formatos.
 
 Atalhos
-- Duplo clique ou Enter: abre o arquivo.
-- Botão direito: abrir pasta, salvar cópia, copiar caminho.
+- Enter: busca.  Esc: limpa a busca.
+- Duplo clique ou Enter na lista: abre o arquivo.
+- Botão direito: abrir pasta, salvar cópia, copiar caminho, ver cópias.
 - Ctrl+clique / Shift+clique: seleciona vários para salvar cópia de uma vez.
 """
 
 
 # --------------------------------------------------------------------------
-# Log de erros e permissoes
+# Log de erros, recursos e permissoes
 # --------------------------------------------------------------------------
 
 def configurar_log():
@@ -133,6 +111,37 @@ def configurar_log():
     sys.excepthook = gancho
     threading.excepthook = lambda a: logging.critical(
         "Erro em tarefa de fundo", exc_info=(a.exc_type, a.exc_value, a.exc_traceback))
+
+
+def caminho_recurso(*partes) -> Path:
+    """Arquivos embutidos (ex.: logo): no .exe ficam em _MEIPASS; no codigo-fonte, na raiz do projeto."""
+    base = getattr(sys, "_MEIPASS", None) or Path(__file__).resolve().parent.parent
+    return Path(base).joinpath(*partes)
+
+
+def carregar_logo(largura_max, altura_max):
+    """Carrega assets/logo.png, corta as bordas transparentes e reduz. None se falhar."""
+    try:
+        from PIL import Image, ImageTk
+        img = Image.open(caminho_recurso("assets", "logo.png")).convert("RGBA")
+        caixa = img.getchannel("A").getbbox()
+        if caixa:
+            img = img.crop(caixa)
+        img.thumbnail((largura_max, altura_max), getattr(Image, "Resampling", Image).LANCZOS)
+        return ImageTk.PhotoImage(img)
+    except Exception:
+        log.warning("Logomarca não carregada", exc_info=True)
+        return None
+
+
+def aplicar_icone(janela):
+    """Icone da barra de titulo e da barra de tarefas (vale para todas as janelas do app)."""
+    ico = caminho_recurso("assets", "icone.ico")
+    if sys.platform.startswith("win") and ico.is_file():
+        try:
+            janela.iconbitmap(default=str(ico))
+        except tk.TclError:
+            log.debug("Ícone não aplicado", exc_info=True)
 
 
 def empresas_permitidas(usuario, empresas):
@@ -203,6 +212,16 @@ def extrair_do_zip(caminho_zip, interno, destino_dir):
     with open(destino, "wb") as f:
         f.write(dados)
     return destino
+
+
+def formatar_data(mtime):
+    return time.strftime("%d/%m/%Y %H:%M", time.localtime(mtime)) if mtime else ""
+
+
+def formatar_tamanho(n):
+    if n >= 1024 * 1024:
+        return f"{n / 1024 / 1024:.1f} MB".replace(".", ",")
+    return f"{max(1, round(n / 1024))} KB"
 
 
 # --------------------------------------------------------------------------
@@ -376,6 +395,117 @@ class TelaUsuarios(tk.Toplevel):
 
 
 # --------------------------------------------------------------------------
+# Exportar indice / cópias de um documento
+# --------------------------------------------------------------------------
+
+class TelaExportar(tk.Toplevel):
+    """Escolha das empresas a exportar. resultado = (pastas ou None para tudo, incluir_fora)."""
+
+    def __init__(self, master, empresas):
+        super().__init__(master)
+        self.empresas = empresas
+        self.resultado = None
+        self.title("Exportar índice")
+        self.resizable(False, False)
+        f = ttk.Frame(self, padding=14)
+        f.pack(fill="both", expand=True)
+
+        ttk.Label(f, text="Empresas a exportar:", font=("Segoe UI", 10, "bold")).grid(row=0, column=0, sticky="w")
+        caixa = ttk.Frame(f)
+        caixa.grid(row=1, column=0, sticky="nsew", pady=(4, 6))
+        self.lista = tk.Listbox(caixa, selectmode="multiple", height=min(14, max(4, len(empresas))),
+                                width=46, exportselection=False, activestyle="none")
+        sb = ttk.Scrollbar(caixa, orient="vertical", command=self.lista.yview)
+        self.lista.configure(yscrollcommand=sb.set)
+        self.lista.pack(side="left", fill="both", expand=True)
+        sb.pack(side="right", fill="y")
+        for nome, _ in empresas:
+            self.lista.insert("end", nome)
+        self.lista.select_set(0, "end")
+
+        bts = ttk.Frame(f)
+        bts.grid(row=2, column=0, sticky="w")
+        ttk.Button(bts, text="Marcar todas", command=lambda: self.lista.select_set(0, "end")).pack(side="left")
+        ttk.Button(bts, text="Desmarcar todas",
+                   command=lambda: self.lista.select_clear(0, "end")).pack(side="left", padx=6)
+
+        self.var_fora = tk.BooleanVar(value=True)
+        ttk.Checkbutton(f, text='Incluir arquivos fora das pastas "DB_"',
+                        variable=self.var_fora).grid(row=3, column=0, sticky="w", pady=(8, 0))
+        ttk.Label(f, foreground="#a0522d", wraplength=380, justify="left",
+                  text="⚠ O arquivo exportado contém o texto dos documentos. Envie só por um "
+                       "canal privado e só para quem tem direito a esse conteúdo.").grid(
+            row=4, column=0, sticky="w", pady=(10, 0))
+
+        fim = ttk.Frame(f)
+        fim.grid(row=5, column=0, sticky="e", pady=(12, 0))
+        ttk.Button(fim, text="Exportar...", command=self.confirmar).pack(side="left", padx=4)
+        ttk.Button(fim, text="Cancelar", command=self.destroy).pack(side="left")
+        self.transient(master)
+        self.grab_set()
+
+    def confirmar(self):
+        sel = list(self.lista.curselection())
+        fora = self.var_fora.get()
+        if not sel and not fora:
+            messagebox.showwarning("Exportar índice", "Escolha ao menos uma empresa.", parent=self)
+            return
+        if len(sel) == len(self.empresas) and fora:
+            self.resultado = (None, True)                       # indice inteiro
+        else:
+            self.resultado = ([self.empresas[i][1] for i in sel], fora)
+        self.destroy()
+
+
+class TelaCopias(tk.Toplevel):
+    """Todas as copias e versoes de um documento que apareceu uma vez so na busca."""
+
+    def __init__(self, master, principal, ao_abrir, ao_abrir_pasta):
+        super().__init__(master)
+        self.itens = principal["copias"]
+        self.ao_abrir = ao_abrir
+        self.ao_abrir_pasta = ao_abrir_pasta
+        self.title(f"Cópias e versões — {core._nome_documento(principal)}")
+        self.geometry("980x320")
+        f = ttk.Frame(self, padding=10)
+        f.pack(fill="both", expand=True)
+        ttk.Label(f, text="★ = exibida na busca (versão mais recente, no caminho mais curto). "
+                          "Mesmo tamanho = cópia idêntica; tamanho diferente = outra versão.",
+                  foreground="#555").pack(anchor="w", pady=(0, 6))
+        self.tv = ttk.Treeview(f, columns=("data", "tamanho", "pasta"), selectmode="extended")
+        self.tv.heading("#0", text="Arquivo")
+        self.tv.heading("data", text="Modificado em")
+        self.tv.heading("tamanho", text="Tamanho")
+        self.tv.heading("pasta", text="Pasta")
+        self.tv.column("#0", width=280)
+        self.tv.column("data", width=120, anchor="center", stretch=False)
+        self.tv.column("tamanho", width=80, anchor="e", stretch=False)
+        self.tv.column("pasta", width=460)
+        self.tv.pack(fill="both", expand=True)
+        for i, r in enumerate(self.itens):
+            marca = "★ " if (r["caminho"], r["interno"]) == (principal["caminho"], principal["interno"]) else "    "
+            nome = r["nome"] + (f"  ›  {r['interno']}" if r["interno"] else "")
+            self.tv.insert("", "end", iid=str(i), text=marca + nome,
+                           values=(formatar_data(r.get("mtime")), formatar_tamanho(r.get("tamanho", 0)), r["pasta"]))
+        self.tv.bind("<Double-1>", lambda e: self._abrir())
+        b = ttk.Frame(f)
+        b.pack(fill="x", pady=(8, 0))
+        ttk.Button(b, text="Abrir", command=self._abrir).pack(side="left")
+        ttk.Button(b, text="Abrir pasta", command=self._pasta).pack(side="left", padx=6)
+        ttk.Button(b, text="Fechar", command=self.destroy).pack(side="right")
+        self.transient(master)
+
+    def _sel(self):
+        return [self.itens[int(k)] for k in self.tv.selection()]
+
+    def _abrir(self):
+        self.ao_abrir(self._sel())
+
+    def _pasta(self):
+        self.ao_abrir_pasta(self._sel())
+
+
+# --------------------------------------------------------------------------
 # Menu lateral de empresas
 # --------------------------------------------------------------------------
 
@@ -506,11 +636,13 @@ class App:
         self.usuarios = usuarios
         self.cfg = carregar_config()
         self.fila = queue.Queue()
-        self.trabalhando = False
+        self.trabalhando = False     # alguma tarefa longa em andamento (indexar/exportar/importar)
+        self.tarefa = None           # "indexar", "indexar_auto", "exportar", "importar"
         self.atualizando = False
         self.cancelar_flag = threading.Event()
         self.indice_busca = None
-        self.resultados = []
+        self.resultados = []         # tudo o que a busca encontrou
+        self.exibidos = []           # o que esta na lista (filtro de tipo + copias agrupadas)
         self.empresa = None          # caminho da pasta da empresa; None = todas
         self.empresa_nome = None
         self.temp_dir = tempfile.mkdtemp(prefix="buscadatabook_")
@@ -553,8 +685,27 @@ class App:
         arq.add_command(label="Recarregar lista de empresas", command=lambda: self._carregar_empresas(manter=True))
         arq.add_command(label="Arquivos que não puderam ser lidos", command=self.ver_erros)
         arq.add_separator()
+        arq.add_command(label="Exportar índice...", command=self.exportar_indice)
+        arq.add_command(label="Importar índice...", command=self.importar_indice)
+        arq.add_separator()
         arq.add_command(label="Sair", command=self.sair)
         m.add_cascade(label="Arquivo", menu=arq)
+
+        op = tk.Menu(m, tearoff=0)
+        self.var_ocr = tk.BooleanVar(value=self.cfg.get("ocr", True))
+        self.var_auto_idx = tk.BooleanVar(value=self.cfg.get("atualizar_ao_abrir", True))
+        self.var_nuvem = tk.BooleanVar(value=self.cfg.get("economizar_onedrive", True))
+        self.var_auto_upd = tk.BooleanVar(value=self.cfg.get("verificar_atualizacoes", True))
+        op.add_checkbutton(label="Ler PDFs escaneados (OCR) ao indexar", variable=self.var_ocr,
+                           command=self._salvar_cfg)
+        op.add_checkbutton(label="Atualizar o índice ao abrir o programa", variable=self.var_auto_idx,
+                           command=self._salvar_cfg)
+        op.add_checkbutton(label="Economizar espaço do OneDrive (devolver à nuvem após ler)",
+                           variable=self.var_nuvem, command=self._salvar_cfg)
+        op.add_checkbutton(label="Verificar atualizações do programa ao iniciar", variable=self.var_auto_upd,
+                           command=self._salvar_cfg)
+        m.add_cascade(label="Opções", menu=op)
+
         if self.usuario["admin"]:
             m.add_command(label="Usuários", command=lambda: TelaUsuarios(self.root, self.usuarios, self.usuario["login"]))
         else:
@@ -562,9 +713,6 @@ class App:
         aj = tk.Menu(m, tearoff=0)
         aj.add_command(label="Como buscar", command=lambda: messagebox.showinfo("Como buscar", DICAS))
         aj.add_command(label="Verificar atualizações", command=lambda: self._verificar_atualizacao(manual=True))
-        self.var_auto_upd = tk.BooleanVar(value=self.cfg.get("verificar_atualizacoes", True))
-        aj.add_checkbutton(label="Verificar atualizações ao iniciar", variable=self.var_auto_upd,
-                           command=self._salvar_cfg)
         aj.add_separator()
         aj.add_command(label="Sobre", command=self._sobre)
         m.add_cascade(label="Ajuda", menu=aj)
@@ -594,7 +742,7 @@ class App:
         self.cb_pasta.bind("<Return>", lambda e: self._pasta_mudou())
         ttk.Button(topo, text="Procurar...", command=self.escolher_pasta).grid(row=0, column=2, padx=2)
         self.bt_indice = ttk.Button(topo, text="Atualizar índice", command=self.atualizar_indice)
-        self.bt_indice.grid(row=0, column=3, padx=2)
+        self.bt_indice.grid(row=0, column=3, columnspan=2, sticky="ew", padx=2)
 
         self.lbl_info = ttk.Label(topo, text="", foreground="#555")
         self.lbl_info.grid(row=1, column=1, sticky="w", padx=6, pady=(2, 8))
@@ -604,32 +752,36 @@ class App:
         self.e_termo = ttk.Entry(topo, textvariable=self.var_termo, font=("Segoe UI", 11))
         self.e_termo.grid(row=2, column=1, sticky="ew", padx=6)
         self.e_termo.bind("<Return>", lambda e: self.buscar())
+        self.root.bind("<Escape>", lambda e: self.limpar_busca())
         ttk.Button(topo, text="Buscar", command=self.buscar).grid(row=2, column=2, padx=2)
+        ttk.Button(topo, text="Limpar", command=self.limpar_busca).grid(row=2, column=3, padx=2)
         self.var_filtro = tk.StringVar(value="Todos os tipos")
         cb = ttk.Combobox(topo, textvariable=self.var_filtro, values=list(FILTROS), state="readonly", width=18)
-        cb.grid(row=2, column=3, padx=2)
+        cb.grid(row=2, column=4, padx=2)
         cb.bind("<<ComboboxSelected>>", lambda e: self._mostrar_resultados())
 
         self.lbl_escopo = ttk.Label(topo, text="", style="Escopo.TLabel")
         self.lbl_escopo.grid(row=3, column=1, sticky="w", padx=6, pady=(6, 0))
-        self.var_ocr = tk.BooleanVar(value=self.cfg.get("ocr", True))
-        ttk.Checkbutton(topo, text="Ler PDFs escaneados (OCR) ao indexar", variable=self.var_ocr,
-                        command=self._salvar_cfg).grid(row=3, column=2, columnspan=2, sticky="e", pady=(6, 0))
+        self.var_ocultar = tk.BooleanVar(value=self.cfg.get("ocultar_repetidos", True))
+        ttk.Checkbutton(topo, text="Ocultar cópias e versões antigas", variable=self.var_ocultar,
+                        command=self._ocultar_mudou).grid(row=3, column=2, columnspan=3, sticky="e", pady=(6, 0))
 
         # resultados
         meio = ttk.Frame(principal, padding=(10, 4))
         meio.pack(fill="both", expand=True)
-        cols = ("tipo", "onde", "trecho", "pasta")
+        cols = ("tipo", "onde", "copias", "trecho", "pasta")
         self.tv = ttk.Treeview(meio, columns=cols, selectmode="extended")
         self.tv.heading("#0", text="Arquivo", command=lambda: self._ordenar("#0"))
         self.tv.heading("tipo", text="Tipo", command=lambda: self._ordenar("tipo"))
         self.tv.heading("onde", text="Achado no", command=lambda: self._ordenar("onde"))
+        self.tv.heading("copias", text="Cópias")
         self.tv.heading("trecho", text="Trecho")
         self.tv.heading("pasta", text="Pasta", command=lambda: self._ordenar("pasta"))
         self.tv.column("#0", width=280, stretch=False)
         self.tv.column("tipo", width=55, stretch=False, anchor="center")
         self.tv.column("onde", width=80, stretch=False, anchor="center")
-        self.tv.column("trecho", width=430)
+        self.tv.column("copias", width=60, stretch=False, anchor="center")
+        self.tv.column("trecho", width=410)
         self.tv.column("pasta", width=300)
         sy = ttk.Scrollbar(meio, orient="vertical", command=self.tv.yview)
         sx = ttk.Scrollbar(meio, orient="horizontal", command=self.tv.xview)
@@ -648,6 +800,8 @@ class App:
         self.menu_ctx.add_command(label="Abrir pasta do arquivo", command=self.abrir_pasta)
         self.menu_ctx.add_command(label="Salvar cópia...", command=self.salvar_copia)
         self.menu_ctx.add_command(label="Copiar caminho", command=self.copiar_caminho)
+        self.menu_ctx.add_separator()
+        self.menu_ctx.add_command(label="Ver todas as cópias e versões", command=self.ver_copias)
 
         # rodape
         base = ttk.Frame(principal, padding=(10, 4, 10, 10))
@@ -682,7 +836,7 @@ class App:
             self.buscar()
         else:
             self.resultados = []
-            self.tv.delete(*self.tv.get_children())
+            self._mostrar_resultados()
         self.e_termo.focus_set()
 
     def _texto_escopo(self):
@@ -698,6 +852,9 @@ class App:
         if p:
             self.var_pasta.set(p)
             self._pasta_mudou(silencioso=True)
+            # atualizacao automatica em segundo plano (so se a pasta ja foi indexada antes)
+            if self.indice_busca and self.var_auto_idx.get() and self.indice_busca.info()[0] > 0:
+                self.root.after(1500, lambda: self.atualizar_indice(automatico=True))
         self.e_termo.focus_set()
 
     def escolher_pasta(self):
@@ -708,7 +865,8 @@ class App:
 
     def _pasta_mudou(self, silencioso=False):
         if self.trabalhando:
-            messagebox.showinfo(APP_NOME, "Aguarde o fim da indexação (ou cancele) antes de trocar de pasta.")
+            messagebox.showinfo(APP_NOME, "Aguarde o fim da tarefa em andamento (ou cancele) "
+                                          "antes de trocar de pasta.")
             return
         pasta = self.var_pasta.get().strip().strip('"')
         if not pasta:
@@ -725,7 +883,7 @@ class App:
             self.indice_busca.fechar()
         self.indice_busca = core.Indice(pasta)
         self.resultados = []
-        self.tv.delete(*self.tv.get_children())
+        self._mostrar_resultados()
         self._carregar_empresas()
         self._atualizar_info()
         n, _ = self.indice_busca.info()
@@ -744,24 +902,44 @@ class App:
         else:
             self.lbl_info.config(text="Pasta ainda não indexada. Clique em “Atualizar índice”.")
 
-    def atualizar_indice(self):
+    def _iniciar_tarefa(self, tarefa, cancelavel):
+        self.trabalhando = True
+        self.tarefa = tarefa
+        self.cancelar_flag.clear()
+        self.bt_indice.config(state="disabled")
+        self.prog.pack(side="right", padx=4)
+        if cancelavel:
+            self.bt_cancelar.pack(side="right", padx=4)
+        else:
+            self.prog.config(mode="indeterminate")
+            self.prog.start(15)
+
+    def _terminar_tarefa(self):
+        self.trabalhando = False
+        self.tarefa = None
+        self.prog.stop()
+        self.prog.config(mode="determinate", value=0)
+        self.bt_indice.config(state="normal")
+        self.prog.pack_forget()
+        self.bt_cancelar.pack_forget()
+
+    def atualizar_indice(self, automatico=False):
         if self.trabalhando:
             return
         pasta = self.var_pasta.get().strip()
         if not pasta or not os.path.isdir(pasta):
-            messagebox.showwarning(APP_NOME, "Escolha uma pasta válida primeiro.")
+            if not automatico:
+                messagebox.showwarning(APP_NOME, "Escolha uma pasta válida primeiro.")
             return
-        if self.var_ocr.get() and not core.configurar_ocr():
+        if self.var_ocr.get() and not core.configurar_ocr() and not automatico:
             messagebox.showinfo(APP_NOME, "O OCR (Tesseract) não está disponível.\n\n"
                                 "Os PDFs escaneados serão indexados apenas pelo nome. "
                                 "Reinstale o programa para restaurar o OCR.")
-        self.trabalhando = True
-        self.cancelar_flag.clear()
-        self.bt_indice.config(state="disabled")
-        self.prog.pack(side="right", padx=4)
-        self.bt_cancelar.pack(side="right", padx=4)
-        usar_ocr = self.var_ocr.get()
-        threading.Thread(target=self._tarefa_indexar, args=(pasta, usar_ocr), daemon=True).start()
+        self._iniciar_tarefa("indexar_auto" if automatico else "indexar", cancelavel=True)
+        if automatico:
+            self.lbl_status.config(text="Verificando arquivos novos em segundo plano (a busca continua liberada)...")
+        args = (pasta, self.var_ocr.get(), self.var_nuvem.get())
+        threading.Thread(target=self._tarefa_indexar, args=args, daemon=True).start()
 
     def refazer_indice(self):
         pasta = self.var_pasta.get().strip()
@@ -781,12 +959,13 @@ class App:
         self.indice_busca = core.Indice(pasta)
         self.atualizar_indice()
 
-    def _tarefa_indexar(self, pasta, usar_ocr):
+    def _tarefa_indexar(self, pasta, usar_ocr, liberar_nuvem):
         idx = core.Indice(pasta)
         try:
             r = idx.atualizar(usar_ocr=usar_ocr,
                               progresso=lambda m, i, n: self.fila.put(("prog", m, i, n)),
-                              cancelado=self.cancelar_flag.is_set)
+                              cancelado=self.cancelar_flag.is_set,
+                              liberar_nuvem=liberar_nuvem)
             self.fila.put(("fim", r))
         except Exception as e:
             log.exception("Erro ao indexar %s", pasta)
@@ -810,16 +989,20 @@ class App:
                     self._fim_indexacao(msg[1])
                 elif tipo == "erro":
                     self._fim_indexacao(None, msg[1])
+                elif tipo.startswith("exp_") or tipo.startswith("imp_"):
+                    self._fim_exportar_importar(msg)
                 elif tipo.startswith("upd_"):
                     self._tratar_atualizacao(msg)
         except queue.Empty:
             pass
         except Exception:
             log.exception("Erro ao processar mensagens da interface")
-        if ultimo_prog and self.trabalhando:
+        if ultimo_prog and self.trabalhando and self.tarefa in ("indexar", "indexar_auto"):
             _, m, i, n = ultimo_prog
             txt = f"{i}/{n} · {m}" if n else m
-            self.lbl_status.config(text=txt[:120])
+            if self.tarefa == "indexar_auto":
+                txt = "Atualização automática: " + txt
+            self.lbl_status.config(text=txt[:140])
             if n:
                 self.prog.config(mode="determinate", maximum=n, value=i)
             else:
@@ -828,23 +1011,30 @@ class App:
         self.root.after(150, self._processar_fila)
 
     def _fim_indexacao(self, r, erro=None):
-        self.trabalhando = False
-        self.bt_indice.config(state="normal")
-        self.prog.pack_forget()
-        self.bt_cancelar.pack_forget()
+        automatico = self.tarefa == "indexar_auto"
+        self._terminar_tarefa()
         self._atualizar_info()
         self._carregar_empresas(manter=True)   # pode ter surgido uma pasta DB_ nova
         if erro:
-            self.lbl_status.config(text="Erro ao indexar.")
-            messagebox.showerror(APP_NOME, f"Erro ao indexar:\n{erro}\n\nDetalhes em:\n{ARQUIVO_LOG}")
+            self.lbl_status.config(text=f"Erro ao indexar (detalhes em {ARQUIVO_LOG.name}).")
+            if not automatico:
+                messagebox.showerror(APP_NOME, f"Erro ao indexar:\n{erro}\n\nDetalhes em:\n{ARQUIVO_LOG}")
             return
-        txt = f"Índice atualizado: {r['lidos']} lidos/relidos, {r['removidos']} removidos"
+        if automatico and not (r["lidos"] or r["removidos"]) and not r["falhas"]:
+            txt = "Índice em dia: nenhum arquivo novo ou alterado"
+        else:
+            txt = f"Índice atualizado: {r['lidos']} lidos/relidos, {r['removidos']} removidos"
+        if r.get("liberados"):
+            txt += f", {r['liberados']} devolvidos à nuvem do OneDrive"
         if r["erros"]:
             txt += f", {r['erros']} não puderam ser lidos (Arquivo > Arquivos que não puderam ser lidos)"
+        if r.get("falhas"):
+            txt += (f". ⚠ {r['falhas']} pasta(s)/arquivo(s) inacessíveis (rede/VPN?): "
+                    "por segurança nada foi removido do índice")
         if r["cancelado"]:
             txt = "Indexação cancelada. " + txt
         self.lbl_status.config(text=txt + ".")
-        if self.var_termo.get().strip():
+        if self.var_termo.get().strip() and (not automatico or r["lidos"] or r["removidos"]):
             self.buscar()
 
     def ver_erros(self):
@@ -862,6 +1052,109 @@ class App:
         for c, s in erros:
             t.insert("end", f"{c}\n    {s}\n")
         t.config(state="disabled")
+
+    # ---- exportar / importar indice --------------------------------------
+
+    def exportar_indice(self):
+        if self.trabalhando:
+            messagebox.showinfo(APP_NOME, "Aguarde o fim da tarefa em andamento (ou cancele).")
+            return
+        if not self.indice_busca or self.indice_busca.info()[0] == 0:
+            messagebox.showinfo(APP_NOME, "Escolha uma pasta principal já indexada para exportar.")
+            return
+        tela = TelaExportar(self.root, self.indice_busca.empresas())
+        self.root.wait_window(tela)
+        if tela.resultado is None:
+            return
+        pastas, fora = tela.resultado
+        base = os.path.basename(self.indice_busca.raiz.rstrip("\\/")) or "Indice"
+        destino = filedialog.asksaveasfilename(
+            title="Salvar índice exportado", defaultextension=core.EXT_EXPORTACAO,
+            initialfile=f"Indice_{base}_{time.strftime('%Y-%m-%d')}{core.EXT_EXPORTACAO}",
+            filetypes=[("Índice do Busca Databook", f"*{core.EXT_EXPORTACAO}")])
+        if not destino:
+            return
+        raiz = self.indice_busca.raiz
+        self._iniciar_tarefa("exportar", cancelavel=False)
+        self.lbl_status.config(text="Exportando índice...")
+
+        def tarefa():
+            idx = core.Indice(raiz)
+            try:
+                self.fila.put(("exp_fim", idx.exportar(destino, pastas, fora), destino))
+            except Exception as e:
+                log.exception("Erro ao exportar índice")
+                self.fila.put(("exp_erro", str(e)))
+            finally:
+                idx.fechar()
+
+        threading.Thread(target=tarefa, daemon=True).start()
+
+    def importar_indice(self):
+        if self.trabalhando:
+            messagebox.showinfo(APP_NOME, "Aguarde o fim da tarefa em andamento (ou cancele).")
+            return
+        arq = filedialog.askopenfilename(
+            title="Importar índice",
+            filetypes=[("Índice do Busca Databook", f"*{core.EXT_EXPORTACAO}"), ("Todos os arquivos", "*.*")])
+        if not arq:
+            return
+        try:
+            info = core.ler_exportacao(arq)
+        except ValueError as e:
+            messagebox.showerror(APP_NOME, str(e))
+            return
+        raiz = info["raiz"]
+        resumo = (f"Índice com {info['arquivos']:,} arquivos".replace(",", ".")
+                  + (f", exportado em {info['exportado_em']}" if info["exportado_em"] else "")
+                  + f".\n\nPasta de origem:\n{raiz}\n\n")
+        if raiz and os.path.isdir(raiz):
+            resp = messagebox.askyesnocancel(
+                APP_NOME, resumo + "Essa pasta existe neste computador.\n\n"
+                                   "Sim: usar essa pasta\nNão: escolher outra pasta")
+            if resp is None:
+                return
+            nova = raiz if resp else filedialog.askdirectory(title="Onde está a pasta principal neste computador?")
+        else:
+            messagebox.showinfo(APP_NOME, resumo + "Essa pasta não foi encontrada neste computador.\n"
+                                                   "Na próxima tela, escolha onde estão os databooks.")
+            nova = filedialog.askdirectory(title="Onde está a pasta principal neste computador?")
+        if not nova:
+            return
+        nova = os.path.normpath(nova)
+        self._iniciar_tarefa("importar", cancelavel=False)
+        self.lbl_status.config(text="Importando índice...")
+
+        def tarefa():
+            try:
+                self.fila.put(("imp_fim", core.importar_indice(arq, nova), nova))
+            except Exception as e:
+                log.exception("Erro ao importar índice")
+                self.fila.put(("imp_erro", str(e)))
+
+        threading.Thread(target=tarefa, daemon=True).start()
+
+    def _fim_exportar_importar(self, msg):
+        self._terminar_tarefa()
+        tipo = msg[0]
+        if tipo == "exp_fim":
+            _, n, destino = msg
+            self.lbl_status.config(text=f"Índice exportado: {n} arquivos.")
+            messagebox.showinfo(APP_NOME, f"{n:,} arquivos exportados para:\n{destino}".replace(",", ".")
+                                + "\n\nNo outro computador: Arquivo > Importar índice.")
+        elif tipo == "imp_fim":
+            _, n, nova = msg
+            self.var_pasta.set(nova)          # a pasta importada passa a ser a pasta principal
+            self._pasta_mudou(silencioso=True)
+            self.lbl_status.config(text=f"Índice importado: {n} arquivos.")
+            messagebox.showinfo(APP_NOME, f"{n:,} arquivos importados.".replace(",", ".")
+                                + f"\n\nPasta principal configurada:\n{nova}\n\n"
+                                  "A busca já pode ser usada. Para incluir arquivos novos, "
+                                  "clique em “Atualizar índice”.")
+        else:
+            acao = "exportar" if tipo == "exp_erro" else "importar"
+            self.lbl_status.config(text=f"Não foi possível {acao} o índice.")
+            messagebox.showerror(APP_NOME, f"Não foi possível {acao} o índice:\n{msg[1]}")
 
     # ---- busca ------------------------------------------------------------
 
@@ -886,22 +1179,41 @@ class App:
             return
         self._mostrar_resultados()
 
+    def limpar_busca(self):
+        self.var_termo.set("")
+        self.resultados = []
+        self._mostrar_resultados()
+        if not self.trabalhando:
+            self.lbl_status.config(text="Pronto.")
+        self.e_termo.focus_set()
+
+    def _ocultar_mudou(self):
+        self._salvar_cfg()
+        self._mostrar_resultados()
+
     def _mostrar_resultados(self):
         self.tv.delete(*self.tv.get_children())
         filtro = FILTROS.get(self.var_filtro.get())
-        visiveis = 0
-        for i, r in enumerate(self.resultados):
-            if filtro and r["ext"] not in filtro:
-                continue
+        base = [r for r in self.resultados if not filtro or r["ext"] in filtro]
+        if self.var_ocultar.get() and self.indice_busca:
+            self.exibidos = core.agrupar_repetidos(base, self.indice_busca.raiz)
+        else:
+            self.exibidos = base
+        for i, r in enumerate(self.exibidos):
             nome = r["nome"] + (f"  ›  {r['interno']}" if r["interno"] else "")
+            n = len(r.get("copias", ()))
             self.tv.insert("", "end", iid=str(i), text=nome,
-                           values=(r["ext"].upper(), r["onde"], r["trecho"], r["pasta"]))
-            visiveis += 1
+                           values=(r["ext"].upper(), r["onde"], str(n) if n > 1 else "", r["trecho"], r["pasta"]))
         termo = self.var_termo.get().strip()
         if not self.trabalhando and termo:
             onde = self._texto_escopo()
-            self.lbl_status.config(text=f"{visiveis} resultado(s) para “{termo}” em {onde}." if visiveis
-                                   else f"Nada encontrado para “{termo}” em {onde}.")
+            visiveis = len(self.exibidos)
+            txt = (f"{visiveis} resultado(s) para “{termo}” em {onde}." if visiveis
+                   else f"Nada encontrado para “{termo}” em {onde}.")
+            ocultos = len(base) - visiveis
+            if ocultos:
+                txt += f" {ocultos} cópia(s)/versão(ões) antiga(s) ocultas."
+            self.lbl_status.config(text=txt)
 
     def _ordenar(self, col):
         inverso = self.ordem.get(col, False)
@@ -915,7 +1227,7 @@ class App:
     # ---- acoes sobre resultados ------------------------------------------
 
     def _selecionados(self):
-        return [self.resultados[int(k)] for k in self.tv.selection()]
+        return [self.exibidos[int(k)] for k in self.tv.selection()]
 
     def _menu_contexto(self, ev):
         linha = self.tv.identify_row(ev.y)
@@ -924,8 +1236,17 @@ class App:
                 self.tv.selection_set(linha)
             self.menu_ctx.tk_popup(ev.x_root, ev.y_root)
 
-    def abrir(self):
-        for r in self._selecionados()[:10]:
+    def _permitido(self, r):
+        """So abre arquivos de dentro da pasta principal (protege contra indices adulterados)."""
+        if self.indice_busca and self.indice_busca.contem(r["caminho"]):
+            return True
+        messagebox.showwarning(APP_NOME, f"Por segurança, só são abertos arquivos da pasta principal:\n{r['caminho']}")
+        return False
+
+    def abrir(self, itens=None):
+        for r in (self._selecionados() if itens is None else itens)[:10]:
+            if not self._permitido(r):
+                continue
             try:
                 if not os.path.exists(r["caminho"]):
                     messagebox.showwarning(APP_NOME, f"Arquivo não encontrado (movido ou apagado?):\n{r['caminho']}\n\n"
@@ -940,10 +1261,19 @@ class App:
                 log.warning("Falha ao abrir %s", r["caminho"], exc_info=True)
                 messagebox.showerror(APP_NOME, f"Não foi possível abrir:\n{r['caminho']}\n\n{e}")
 
-    def abrir_pasta(self):
-        sel = self._selecionados()
-        if sel:
+    def abrir_pasta(self, itens=None):
+        sel = self._selecionados() if itens is None else itens
+        if sel and self._permitido(sel[0]):
             mostrar_na_pasta(sel[0]["caminho"])
+
+    def ver_copias(self):
+        sel = self._selecionados()
+        if not sel:
+            return
+        if len(sel[0].get("copias", ())) < 2:
+            messagebox.showinfo(APP_NOME, "Este documento não tem outras cópias ou versões nos resultados.")
+            return
+        TelaCopias(self.root, sel[0], self.abrir, self.abrir_pasta)
 
     def salvar_copia(self):
         sel = self._selecionados()
@@ -958,6 +1288,9 @@ class App:
         self._salvar_cfg()
         ok, falhas = 0, []
         for r in sel:
+            if not self.indice_busca or not self.indice_busca.contem(r["caminho"]):
+                falhas.append(f"{r['nome']}: fora da pasta principal")
+                continue
             try:
                 if r["interno"]:
                     extrair_do_zip(r["caminho"], r["interno"], destino)
@@ -1007,7 +1340,7 @@ class App:
         except Exception as e:
             messagebox.showerror(APP_NOME, str(e))
 
-    # ---- atualizacao automatica ------------------------------------------
+    # ---- atualizacao automatica do programa ------------------------------
 
     def _verificacao_automatica(self):
         if not (updater.rodando_instalado() and self.var_auto_upd.get()):
@@ -1091,14 +1424,17 @@ class App:
     # ---- encerrar ----------------------------------------------------------
 
     def _salvar_cfg(self):
-        self.cfg["ocr"] = bool(self.var_ocr.get()) if hasattr(self, "var_ocr") else True
-        if hasattr(self, "var_auto_upd"):
-            self.cfg["verificar_atualizacoes"] = bool(self.var_auto_upd.get())
+        for chave, var in (("ocr", "var_ocr"), ("atualizar_ao_abrir", "var_auto_idx"),
+                           ("economizar_onedrive", "var_nuvem"), ("verificar_atualizacoes", "var_auto_upd"),
+                           ("ocultar_repetidos", "var_ocultar")):
+            if hasattr(self, var):
+                self.cfg[chave] = bool(getattr(self, var).get())
         salvar_config(self.cfg)
 
     def sair(self, forcar=False):
-        if self.trabalhando and not forcar and not messagebox.askyesno(
-                APP_NOME, "A indexação está em andamento. Sair mesmo assim?\n"
+        # a atualizacao automatica e interrompida sem perguntar; as demais tarefas pedem confirmacao
+        if self.trabalhando and not forcar and self.tarefa != "indexar_auto" and not messagebox.askyesno(
+                APP_NOME, "Há uma tarefa em andamento. Sair mesmo assim?\n"
                           "(O que já foi lido fica salvo.)"):
             return
         self.cancelar_flag.set()

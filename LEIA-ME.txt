@@ -1,10 +1,25 @@
-BUSCA DATABOOK 3.0
+BUSCA DATABOOK 3.2
 ==================
 
 Programa para Windows que procura uma palavra (ex.: "Trafo") dentro dos
 documentos de uma pasta e de todas as suas subpastas: no PC, na rede
 (ex.: \\servidor\projetos ou uma unidade mapeada) ou na nuvem sincronizada
 (OneDrive, Google Drive para computador, SharePoint sincronizado).
+
+
+NOVIDADES DA 3.2
+----------------
+- Busca "Somente nome do arquivo": procura só no nome (com a extensão),
+  sem olhar o conteúdo nem as pastas. Escolha em "Procurar no:".
+- Senha esquecida:
+  * O administrador usa Usuários > Redefinir senha: o programa gera uma
+    senha provisória, e no próximo acesso o usuário é obrigado a criar a
+    própria senha.
+  * Cada usuário recebe um CÓDIGO DE RECUPERAÇÃO (XXXX-XXXX-XXXX), mostrado
+    uma única vez. Com ele, "Esqueci minha senha" na tela de acesso cria uma
+    senha nova sem precisar do administrador. Cada código vale uma vez.
+  * Menu Minha conta: trocar a própria senha ou gerar um novo código.
+- Usuários novos são criados com senha provisória gerada pelo programa.
 
 
 NOVIDADES DA 3.0
@@ -77,8 +92,9 @@ ONDE FICAM OS DADOS
    atualizacoes\   instalador baixado (apagado na abertura seguinte)
 
 Os usuários são locais de cada computador / usuário do Windows.
-Esqueceu a senha do administrador? Apague o arquivo usuarios.db; no próximo
-acesso o programa pede para criar um novo administrador.
+Esqueceu a senha? Use "Esqueci minha senha" com o seu código de recuperação,
+ou peça ao administrador para redefinir. Último recurso (perde todos os
+usuários): apagar o arquivo usuarios.db.
 A desinstalação NÃO apaga esses dados.
 
 

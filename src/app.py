@@ -70,28 +70,34 @@ trafo bucha
 trafo OU bucha
     Documentos que tenham QUALQUER uma delas.
 
+Procurar no
+• "Nome e conteúdo": procura dentro dos documentos e nos nomes.
+• "Somente nome do arquivo": procura só no nome do arquivo (com a
+  extensão), sem olhar o conteúdo nem as pastas. Ex.: TR 1098830287
+  ou "Elera comissionamento" ou relatorio pdf.
+
 Empresas
-- O menu azul à esquerda mostra as pastas "DB_NOME" da pasta principal.
-- Clique numa empresa para buscar só na pasta dela (e subpastas).
-- "Todas" busca na pasta principal inteira.
+• O menu azul à esquerda mostra as pastas "DB_NOME" da pasta principal.
+• Clique numa empresa para buscar só na pasta dela (e subpastas).
+• "Todas" busca na pasta principal inteira.
 
 Cópias e versões
-- Documentos com o mesmo nome na mesma empresa aparecem uma vez só:
+• Documentos com o mesmo nome na mesma empresa aparecem uma vez só:
   a versão mais recente, no caminho mais curto.
-- A coluna "Cópias" mostra quantos existem. Botão direito >
+• A coluna "Cópias" mostra quantos existem. Botão direito >
   "Ver todas as cópias e versões" lista todos.
-- Desmarque "Ocultar cópias e versões antigas" para ver tudo.
+• Desmarque "Ocultar cópias e versões antigas" para ver tudo.
 
 O que é lido
-- Conteúdo: Word, Excel, PowerPoint, PDF (inclusive escaneado, por OCR),
+• Conteúdo: Word, Excel, PowerPoint, PDF (inclusive escaneado, por OCR),
   textos, e arquivos dentro de .zip.
-- Só o nome: imagens (PNG, JPEG...), MPP, DWG, DWF e demais formatos.
+• Só o nome: imagens (PNG, JPEG...), MPP, DWG, DWF e demais formatos.
 
 Atalhos
-- Enter: busca.  Esc: limpa a busca.
-- Duplo clique ou Enter na lista: abre o arquivo.
-- Botão direito: abrir pasta, salvar cópia, copiar caminho, ver cópias.
-- Ctrl+clique / Shift+clique: seleciona vários para salvar cópia de uma vez.
+• Enter: busca.  Esc: limpa a busca.
+• Duplo clique ou Enter na lista: abre o arquivo.
+• Botão direito: abrir pasta, salvar cópia, copiar caminho, ver cópias.
+• Ctrl+clique / Shift+clique: seleciona vários para salvar cópia de uma vez.
 """
 
 
@@ -263,6 +269,12 @@ class TelaLogin(tk.Toplevel):
         b.grid(row=linha, column=0, columnspan=2, pady=(12, 0))
         ttk.Button(b, text="Entrar", command=self.entrar).pack(side="left", padx=4)
         ttk.Button(b, text="Sair", command=self.cancelar).pack(side="left", padx=4)
+        if not self.primeiro_acesso:
+            esqueci = ttk.Label(f, text="Esqueci minha senha", foreground="#0645AD", cursor="hand2",
+                                font=("Segoe UI", 9, "underline"))
+            esqueci.grid(row=linha + 1, column=0, columnspan=2, pady=(10, 0))
+            esqueci.bind("<Button-1>", lambda e: self.esqueci())
+            linha += 1
         ttk.Label(f, text=f"versão {VERSAO}", foreground="#888").grid(row=linha + 1, column=0, columnspan=2, pady=(10, 0))
 
         self.bind("<Return>", lambda e: self.entrar())
@@ -282,10 +294,26 @@ class TelaLogin(tk.Toplevel):
         except tk.TclError:          # janela ainda nao visivel: tenta de novo em seguida
             self.after(100, self.grab_set)
 
-    def entrar(self):
+    def bloqueado(self, parent=None):
+        """True (e avisa) se ainda esta no tempo de espera apos muitas tentativas erradas."""
         restante = self.bloqueado_ate - time.monotonic()
         if restante > 0:
-            messagebox.showwarning(APP_NOME, f"Muitas tentativas. Aguarde {int(restante) + 1} segundos.", parent=self)
+            messagebox.showwarning(APP_NOME, f"Muitas tentativas. Aguarde {int(restante) + 1} segundos.",
+                                   parent=parent or self)
+            return True
+        return False
+
+    def registrar_falha(self):
+        """Conta tentativas erradas (senha ou codigo). Devolve True se acabou de bloquear."""
+        self.falhas += 1
+        if self.falhas >= TENTATIVAS_LOGIN:
+            self.falhas = 0
+            self.bloqueado_ate = time.monotonic() + BLOQUEIO_LOGIN_S
+            return True
+        return False
+
+    def entrar(self):
+        if self.bloqueado():
             return
         user, senha = self.e_user.get(), self.e_senha.get()
         if self.primeiro_acesso:
@@ -300,23 +328,199 @@ class TelaLogin(tk.Toplevel):
                 return
         r = self.usuarios.validar(user, senha)
         if not r:
-            self.falhas += 1
             log.warning("Falha de login (usuário informado: %r)", user.strip().lower()[:64])
             self.e_senha.delete(0, "end")
-            if self.falhas >= TENTATIVAS_LOGIN:
-                self.falhas = 0
-                self.bloqueado_ate = time.monotonic() + BLOQUEIO_LOGIN_S
-                messagebox.showerror(APP_NOME, f"Usuário ou senha incorretos.\n\nMuitas tentativas: "
-                                     f"aguarde {BLOQUEIO_LOGIN_S} segundos.", parent=self)
-            else:
-                messagebox.showerror(APP_NOME, "Usuário ou senha incorretos.", parent=self)
+            extra = (f"\n\nMuitas tentativas: aguarde {BLOQUEIO_LOGIN_S} segundos."
+                     if self.registrar_falha() else "")
+            messagebox.showerror(APP_NOME, "Usuário ou senha incorretos." + extra, parent=self)
             return
+        self.falhas = 0
+
+        if r["provisoria"]:
+            # senha provisoria (definida pelo administrador): troca obrigatoria antes de entrar
+            tela = TelaNovaSenha(self, self.usuarios, r["login"], obrigatoria=True)
+            self.wait_window(tela)
+            if not tela.ok:
+                self.e_senha.delete(0, "end")
+                return
+            r["provisoria"] = False
+        if not r["tem_codigo"]:
+            # todo usuario recebe um codigo de recuperacao (inclusive os que ja existiam)
+            mostrar_codigo(self, self.usuarios.gerar_codigo(r["login"]))
+            log.info("Código de recuperação gerado para %s", r["login"])
+
         log.info("Login: %s", r["login"])
         self.resultado = r
         self.destroy()
 
+    def esqueci(self):
+        if self.bloqueado():
+            return
+        TelaRecuperar(self, self.usuarios, self.e_user.get())
+
     def cancelar(self):
         self.resultado = None
+        self.destroy()
+
+
+class TelaNovaSenha(tk.Toplevel):
+    """Cria uma senha nova. obrigatoria=True: primeiro acesso com senha provisoria."""
+
+    def __init__(self, master, usuarios, login, obrigatoria=False):
+        super().__init__(master)
+        self.usuarios, self.login, self.ok = usuarios, login, False
+        self.title("Criar nova senha")
+        self.resizable(False, False)
+        f = ttk.Frame(self, padding=18)
+        f.pack(fill="both", expand=True)
+        msg = (f"Olá, {login}. Sua senha atual é provisória.\nCrie agora a sua senha pessoal para continuar."
+               if obrigatoria else f"Nova senha para {login}.")
+        ttk.Label(f, text=msg, justify="left").grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 10))
+        ttk.Label(f, text="Nova senha:").grid(row=1, column=0, sticky="e", padx=4, pady=4)
+        self.e1 = ttk.Entry(f, width=28, show="•")
+        self.e1.grid(row=1, column=1, pady=4)
+        ttk.Label(f, text="Repita a senha:").grid(row=2, column=0, sticky="e", padx=4, pady=4)
+        self.e2 = ttk.Entry(f, width=28, show="•")
+        self.e2.grid(row=2, column=1, pady=4)
+        ttk.Label(f, text=f"Mínimo de {core.SENHA_MIN} caracteres.", foreground="#666").grid(
+            row=3, column=1, sticky="w")
+        b = ttk.Frame(f)
+        b.grid(row=4, column=0, columnspan=2, pady=(12, 0))
+        ttk.Button(b, text="Salvar", command=self.salvar).pack(side="left", padx=4)
+        ttk.Button(b, text="Cancelar", command=self.destroy).pack(side="left", padx=4)
+        self.bind("<Return>", lambda e: self.salvar())
+        self.transient(master)
+        self.e1.focus_set()
+        self.grab_set()
+
+    def salvar(self):
+        nova = self.e1.get()
+        if nova != self.e2.get():
+            messagebox.showerror(APP_NOME, "As senhas não conferem.", parent=self)
+            return
+        if self.usuarios.validar(self.login, nova):
+            messagebox.showerror(APP_NOME, "A nova senha precisa ser diferente da atual.", parent=self)
+            return
+        try:
+            self.usuarios.trocar_senha(self.login, nova)
+        except ValueError as e:
+            messagebox.showerror(APP_NOME, str(e), parent=self)
+            return
+        log.info("Usuário %s definiu nova senha", self.login)
+        self.ok = True
+        self.destroy()
+
+
+class TelaSegredo(tk.Toplevel):
+    """Mostra uma unica vez um codigo de recuperacao ou uma senha provisoria."""
+
+    def __init__(self, master, titulo, valor, texto, exigir_confirmacao):
+        super().__init__(master)
+        self.title(titulo)
+        self.resizable(False, False)
+        self.protocol("WM_DELETE_WINDOW", self.fechar)
+        f = ttk.Frame(self, padding=18)
+        f.pack(fill="both", expand=True)
+        ttk.Label(f, text=texto, justify="left", wraplength=420).pack(anchor="w")
+        caixa = tk.Entry(f, font=("Consolas", 18, "bold"), justify="center", width=18,
+                         relief="solid", bd=1, readonlybackground="#F2F5FB", fg=AZUL)
+        caixa.insert(0, valor)
+        caixa.config(state="readonly")
+        caixa.pack(pady=14, ipady=6)
+        ttk.Button(f, text="Copiar", command=lambda: (self.clipboard_clear(), self.clipboard_append(valor))
+                   ).pack()
+        self.var_ok = tk.BooleanVar(value=not exigir_confirmacao)
+        if exigir_confirmacao:
+            ttk.Checkbutton(f, text="Guardei o código em local seguro", variable=self.var_ok,
+                            command=lambda: self.bt.config(state="normal" if self.var_ok.get() else "disabled")
+                            ).pack(pady=(14, 0))
+        self.bt = ttk.Button(f, text="Fechar", command=self.fechar,
+                             state="normal" if not exigir_confirmacao else "disabled")
+        self.bt.pack(pady=(10, 0))
+        self.transient(master)
+        self.grab_set()
+        self.focus_force()
+
+    def fechar(self):
+        if self.var_ok.get():
+            try:
+                self.clipboard_clear()   # nao deixa o segredo esquecido na area de transferencia
+            except tk.TclError:
+                pass
+            self.destroy()
+
+
+def mostrar_codigo(master, codigo):
+    tela = TelaSegredo(
+        master, "Código de recuperação", codigo,
+        "Este é o seu código de recuperação. Se você esquecer a senha, use-o em "
+        "“Esqueci minha senha” na tela de acesso para criar uma nova.\n\n"
+        "• Anote em papel ou guarde no seu gerenciador de senhas (não em um arquivo neste computador).\n"
+        "• Ele aparece só agora e vale uma única vez: depois de usado, você recebe outro.\n"
+        "• Não compartilhe com ninguém.", exigir_confirmacao=True)
+    master.wait_window(tela)
+
+
+class TelaRecuperar(tk.Toplevel):
+    """'Esqueci minha senha': usuario + codigo de recuperacao + nova senha."""
+
+    def __init__(self, login_tela, usuarios, login_sugerido=""):
+        super().__init__(login_tela)
+        self.login_tela, self.usuarios = login_tela, usuarios
+        self.title("Esqueci minha senha")
+        self.resizable(False, False)
+        f = ttk.Frame(self, padding=18)
+        f.pack(fill="both", expand=True)
+        ttk.Label(f, justify="left", wraplength=360,
+                  text="Informe o seu código de recuperação para criar uma nova senha.\n"
+                       "Não tem o código? Peça ao administrador para redefinir a sua senha."
+                  ).grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 10))
+        campos = (("Usuário:", ""), ("Código:", ""), ("Nova senha:", "•"), ("Repita a senha:", "•"))
+        self.entradas = []
+        for i, (rotulo, mascara) in enumerate(campos, 1):
+            ttk.Label(f, text=rotulo).grid(row=i, column=0, sticky="e", padx=4, pady=4)
+            e = ttk.Entry(f, width=28, show=mascara)
+            e.grid(row=i, column=1, pady=4)
+            self.entradas.append(e)
+        self.entradas[0].insert(0, login_sugerido.strip())
+        ttk.Label(f, text="Código no formato XXXX-XXXX-XXXX", foreground="#666").grid(row=5, column=1, sticky="w")
+        b = ttk.Frame(f)
+        b.grid(row=6, column=0, columnspan=2, pady=(12, 0))
+        ttk.Button(b, text="Criar nova senha", command=self.confirmar).pack(side="left", padx=4)
+        ttk.Button(b, text="Cancelar", command=self.destroy).pack(side="left", padx=4)
+        self.bind("<Return>", lambda e: self.confirmar())
+        self.transient(login_tela)
+        (self.entradas[1] if login_sugerido.strip() else self.entradas[0]).focus_set()
+        self.grab_set()
+
+    def confirmar(self):
+        if self.login_tela.bloqueado(parent=self):
+            return
+        login, codigo, nova, nova2 = (e.get() for e in self.entradas)
+        if nova != nova2:
+            messagebox.showerror(APP_NOME, "As senhas não conferem.", parent=self)
+            return
+        try:
+            novo_codigo = self.usuarios.recuperar(login, codigo, nova)
+        except ValueError as e:
+            messagebox.showerror(APP_NOME, str(e), parent=self)
+            return
+        if not novo_codigo:
+            log.warning("Recuperação de senha recusada (usuário informado: %r)", login.strip().lower()[:64])
+            extra = (f"\n\nMuitas tentativas: aguarde {BLOQUEIO_LOGIN_S} segundos."
+                     if self.login_tela.registrar_falha() else "")
+            messagebox.showerror(APP_NOME, "Usuário ou código de recuperação incorretos.\n"
+                                           "Se não tiver o código, peça ao administrador para "
+                                           "redefinir a sua senha." + extra, parent=self)
+            return
+        log.info("Senha recuperada com código: %s", login.strip().lower())
+        messagebox.showinfo(APP_NOME, "Senha alterada!\n\nO código usado deixou de valer. "
+                                      "Na próxima tela está o seu NOVO código de recuperação.", parent=self)
+        mostrar_codigo(self, novo_codigo)
+        self.login_tela.e_user.delete(0, "end")
+        self.login_tela.e_user.insert(0, login.strip())
+        self.login_tela.e_senha.delete(0, "end")
+        self.login_tela.e_senha.focus_set()
         self.destroy()
 
 
@@ -329,14 +533,16 @@ class TelaUsuarios(tk.Toplevel):
         self.resizable(False, False)
         f = ttk.Frame(self, padding=12)
         f.pack(fill="both", expand=True)
-        self.lista = ttk.Treeview(f, columns=("perfil",), height=8)
+        self.lista = ttk.Treeview(f, columns=("perfil", "situacao"), height=8)
         self.lista.heading("#0", text="Usuário")
         self.lista.heading("perfil", text="Perfil")
-        self.lista.column("#0", width=180)
-        self.lista.column("perfil", width=120)
+        self.lista.heading("situacao", text="Senha")
+        self.lista.column("#0", width=170)
+        self.lista.column("perfil", width=110)
+        self.lista.column("situacao", width=150)
         self.lista.grid(row=0, column=0, rowspan=4, padx=(0, 8))
         ttk.Button(f, text="Novo usuário", command=self.novo).grid(row=0, column=1, sticky="ew", pady=2)
-        ttk.Button(f, text="Trocar senha", command=self.senha).grid(row=1, column=1, sticky="ew", pady=2)
+        ttk.Button(f, text="Redefinir senha", command=self.redefinir).grid(row=1, column=1, sticky="ew", pady=2)
         ttk.Button(f, text="Excluir", command=self.excluir).grid(row=2, column=1, sticky="ew", pady=2)
         ttk.Button(f, text="Fechar", command=self.destroy).grid(row=3, column=1, sticky="sew", pady=2)
         self.recarregar()
@@ -345,41 +551,53 @@ class TelaUsuarios(tk.Toplevel):
 
     def recarregar(self):
         self.lista.delete(*self.lista.get_children())
-        for login, admin in self.usuarios.listar():
-            self.lista.insert("", "end", iid=login, text=login, values=("Administrador" if admin else "Usuário",))
+        for login, admin, provisoria in self.usuarios.listar():
+            self.lista.insert("", "end", iid=login, text=login,
+                              values=("Administrador" if admin else "Usuário",
+                                      "provisória (trocar no acesso)" if provisoria else "definida pelo usuário"))
 
     def selecionado(self):
         s = self.lista.selection()
         return s[0] if s else None
 
+    def _mostrar_provisoria(self, login, senha):
+        tela = TelaSegredo(
+            self, "Senha provisória", senha,
+            f"Senha provisória de “{login}”.\n\nInforme-a ao usuário pessoalmente ou por um canal "
+            "seguro. No próximo acesso ele será obrigado a criar a própria senha, que você não "
+            "conhecerá.", exigir_confirmacao=False)
+        self.wait_window(tela)
+
     def novo(self):
         login = simpledialog.askstring("Novo usuário", "Nome de usuário:", parent=self)
         if not login:
             return
-        senha = simpledialog.askstring("Novo usuário", f"Senha (mínimo {core.SENHA_MIN} caracteres):",
-                                       show="•", parent=self)
-        if senha is None:
-            return
         admin = messagebox.askyesno("Novo usuário", "Este usuário será administrador?", parent=self)
         try:
-            self.usuarios.criar(login, senha, admin)
+            senha = self.usuarios.criar(login, None, admin)       # gera senha provisoria
             log.info("Usuário criado por %s: %s (admin=%s)", self.atual, login.strip().lower(), admin)
         except Exception as e:
             messagebox.showerror("Usuários", f"Não foi possível criar: {e}", parent=self)
+            return
         self.recarregar()
+        self._mostrar_provisoria(login.strip().lower(), senha)
 
-    def senha(self):
+    def redefinir(self):
         s = self.selecionado()
         if not s:
+            messagebox.showinfo("Usuários", "Selecione um usuário na lista.", parent=self)
             return
-        nova = simpledialog.askstring("Trocar senha", f"Nova senha para {s}:", show="•", parent=self)
-        if nova:
-            try:
-                self.usuarios.trocar_senha(s, nova)
-                log.info("Senha de %s alterada por %s", s, self.atual)
-                messagebox.showinfo("Usuários", "Senha alterada.", parent=self)
-            except Exception as e:
-                messagebox.showerror("Usuários", str(e), parent=self)
+        if s == self.atual:
+            messagebox.showinfo("Usuários", "Para a sua própria senha use Minha conta > Trocar minha senha.",
+                                parent=self)
+            return
+        if not messagebox.askyesno("Usuários", f"Redefinir a senha de {s}?\n\nA senha atual deixará de "
+                                               "funcionar e será gerada uma senha provisória.", parent=self):
+            return
+        senha = self.usuarios.redefinir(s)
+        log.info("Senha de %s redefinida (provisória) por %s", s, self.atual)
+        self.recarregar()
+        self._mostrar_provisoria(s, senha)
 
     def excluir(self):
         s = self.selecionado()
@@ -706,10 +924,12 @@ class App:
                            command=self._salvar_cfg)
         m.add_cascade(label="Opções", menu=op)
 
+        conta = tk.Menu(m, tearoff=0)
+        conta.add_command(label="Trocar minha senha", command=self.trocar_minha_senha)
+        conta.add_command(label="Gerar novo código de recuperação", command=self.novo_codigo)
+        m.add_cascade(label="Minha conta", menu=conta)
         if self.usuario["admin"]:
             m.add_command(label="Usuários", command=lambda: TelaUsuarios(self.root, self.usuarios, self.usuario["login"]))
-        else:
-            m.add_command(label="Trocar minha senha", command=self.trocar_minha_senha)
         aj = tk.Menu(m, tearoff=0)
         aj.add_command(label="Como buscar", command=lambda: messagebox.showinfo("Como buscar", DICAS))
         aj.add_command(label="Verificar atualizações", command=lambda: self._verificar_atualizacao(manual=True))
@@ -760,8 +980,16 @@ class App:
         cb.grid(row=2, column=4, padx=2)
         cb.bind("<<ComboboxSelected>>", lambda e: self._mostrar_resultados())
 
-        self.lbl_escopo = ttk.Label(topo, text="", style="Escopo.TLabel")
-        self.lbl_escopo.grid(row=3, column=1, sticky="w", padx=6, pady=(6, 0))
+        linha3 = ttk.Frame(topo)
+        linha3.grid(row=3, column=1, sticky="w", padx=6, pady=(6, 0))
+        ttk.Label(linha3, text="Procurar no:").pack(side="left")
+        self.var_modo = tk.StringVar(value=self.cfg.get("modo_busca", "tudo"))
+        ttk.Radiobutton(linha3, text="Nome e conteúdo", value="tudo", variable=self.var_modo,
+                        command=self._modo_mudou).pack(side="left", padx=(6, 0))
+        ttk.Radiobutton(linha3, text="Somente nome do arquivo", value="nome", variable=self.var_modo,
+                        command=self._modo_mudou).pack(side="left", padx=(8, 0))
+        self.lbl_escopo = ttk.Label(linha3, text="", style="Escopo.TLabel")
+        self.lbl_escopo.pack(side="left", padx=(18, 0))
         self.var_ocultar = tk.BooleanVar(value=self.cfg.get("ocultar_repetidos", True))
         ttk.Checkbutton(topo, text="Ocultar cópias e versões antigas", variable=self.var_ocultar,
                         command=self._ocultar_mudou).grid(row=3, column=2, columnspan=3, sticky="e", pady=(6, 0))
@@ -1172,7 +1400,10 @@ class App:
                 self.atualizar_indice()
             return
         try:
-            self.resultados = self.indice_busca.buscar(termo, pasta=self.empresa)
+            if self.var_modo.get() == "nome":
+                self.resultados = self.indice_busca.buscar_nome(termo, pasta=self.empresa)
+            else:
+                self.resultados = self.indice_busca.buscar(termo, pasta=self.empresa)
         except Exception as e:
             log.exception("Erro na busca")
             messagebox.showerror(APP_NOME, f"Não foi possível buscar: {e}")
@@ -1191,6 +1422,13 @@ class App:
         self._salvar_cfg()
         self._mostrar_resultados()
 
+    def _modo_mudou(self):
+        self.cfg["modo_busca"] = self.var_modo.get()
+        self._salvar_cfg()
+        if self.var_termo.get().strip():
+            self.buscar()
+        self.e_termo.focus_set()
+
     def _mostrar_resultados(self):
         self.tv.delete(*self.tv.get_children())
         filtro = FILTROS.get(self.var_filtro.get())
@@ -1207,6 +1445,8 @@ class App:
         termo = self.var_termo.get().strip()
         if not self.trabalhando and termo:
             onde = self._texto_escopo()
+            if self.var_modo.get() == "nome":
+                onde = "nomes de arquivo, " + onde
             visiveis = len(self.exibidos)
             txt = (f"{visiveis} resultado(s) para “{termo}” em {onde}." if visiveis
                    else f"Nada encontrado para “{termo}” em {onde}.")
@@ -1319,26 +1559,34 @@ class App:
             self.root.clipboard_append(txt)
             self.lbl_status.config(text="Caminho copiado.")
 
-    def trocar_minha_senha(self):
-        atual = simpledialog.askstring("Trocar senha", "Senha atual:", show="•", parent=self.root)
+    def _confirmar_senha_atual(self, titulo):
+        atual = simpledialog.askstring(titulo, "Para confirmar, digite a sua senha atual:", show="•",
+                                       parent=self.root)
         if atual is None:
-            return
+            return False
         if not self.usuarios.validar(self.usuario["login"], atual):
+            log.warning("Senha atual incorreta em '%s' (%s)", titulo, self.usuario["login"])
             messagebox.showerror(APP_NOME, "Senha atual incorreta.")
+            return False
+        return True
+
+    def trocar_minha_senha(self):
+        if not self._confirmar_senha_atual("Trocar senha"):
             return
-        nova = simpledialog.askstring("Trocar senha", f"Nova senha (mínimo {core.SENHA_MIN} caracteres):",
-                                      show="•", parent=self.root)
-        if not nova:
-            return
-        if simpledialog.askstring("Trocar senha", "Repita a nova senha:", show="•", parent=self.root) != nova:
-            messagebox.showerror(APP_NOME, "As senhas não conferem.")
-            return
-        try:
-            self.usuarios.trocar_senha(self.usuario["login"], nova)
-            log.info("Usuário %s trocou a própria senha", self.usuario["login"])
+        tela = TelaNovaSenha(self.root, self.usuarios, self.usuario["login"])
+        self.root.wait_window(tela)
+        if tela.ok:
             messagebox.showinfo(APP_NOME, "Senha alterada.")
-        except Exception as e:
-            messagebox.showerror(APP_NOME, str(e))
+
+    def novo_codigo(self):
+        if not self._confirmar_senha_atual("Novo código de recuperação"):
+            return
+        if not messagebox.askyesno(APP_NOME, "Gerar um novo código de recuperação?\n\n"
+                                             "O código anterior deixará de valer."):
+            return
+        codigo = self.usuarios.gerar_codigo(self.usuario["login"])
+        log.info("Novo código de recuperação gerado por %s", self.usuario["login"])
+        mostrar_codigo(self.root, codigo)
 
     # ---- atualizacao automatica do programa ------------------------------
 

@@ -12,11 +12,13 @@ import io
 import logging
 import os
 import re
+import secrets
 import shutil
 import sqlite3
 import sys
 import threading
 import time
+import unicodedata
 import zipfile
 from pathlib import Path
 
@@ -598,7 +600,7 @@ class Indice:
           trafo bucha      -> documentos com as duas palavras
           trafo OU bucha   -> qualquer uma das palavras
         pasta: se informada, restringe a busca a essa pasta e subpastas (ex.: uma empresa).
-        Devolve lista de dicts: caminho, interno, nome, pasta, ext, trecho, onde, mtime, tamanho.
+        Devolve lista de dicts: caminho, interno, nome, pasta, ext, trecho, onde.
         """
         consulta = montar_consulta(termo)
         if not consulta:
@@ -641,6 +643,55 @@ class Indice:
         for r in resultados:
             r["mtime"], r["tamanho"] = meta.get(r["caminho"], (0.0, 0))
         return resultados
+
+    def buscar_nome(self, termo: str, pasta: str = None, limite=2000):
+        """
+        Busca SO pelo nome do arquivo (com extensao), ignorando o conteudo e as pastas.
+        Vale para arquivos comuns e para arquivos dentro de .zip.
+        Mesmas regras de digitacao da busca normal (prefixo, "frase exata", OU).
+        """
+        grupos = _grupos_nome(termo)
+        if not grupos:
+            return []
+        filtro, params = "", []
+        if pasta:
+            prefixo = self._prefixo_seguro(pasta)
+            filtro = " WHERE substr(caminho, 1, ?) = ?"
+            params = [len(prefixo), prefixo]
+        achados = {}
+
+        # 1) arquivos comuns e o proprio .zip: tabela pequena (um registro por arquivo)
+        for caminho, mtime, tam in self.con.execute(
+                f"SELECT caminho, mtime, tamanho FROM arquivos{filtro}", params):
+            if _nome_casa(os.path.basename(caminho), grupos):
+                achados[(caminho, "")] = (mtime or 0.0, tam or 0)
+
+        # 2) arquivos dentro de .zip: o indice pre-seleciona, o nome confirma
+        consulta = montar_consulta(termo)
+        if consulta:
+            sql_zip = ("SELECT caminho, interno FROM conteudo WHERE conteudo MATCH ? AND interno <> ''"
+                       + (" AND substr(caminho, 1, ?) = ?" if pasta else "") + " LIMIT 20000")
+            zips = [(c, i) for c, i in self.con.execute(sql_zip, [consulta] + params)
+                    if _nome_casa(_nome_documento({"interno": i, "nome": ""}), grupos)]
+            meta = self._meta_arquivos(c for c, _ in zips)
+            for c, i in zips:
+                achados[(c, i)] = meta.get(c, (0.0, 0))
+
+        resultados = []
+        for (caminho, interno), (mtime, tam) in achados.items():
+            resultados.append({
+                "caminho": caminho,
+                "interno": interno,
+                "nome": os.path.basename(caminho),
+                "pasta": os.path.dirname(caminho),
+                "ext": os.path.splitext(interno or caminho)[1].lower().lstrip("."),
+                "trecho": "",
+                "onde": "nome",
+                "mtime": mtime,
+                "tamanho": tam,
+            })
+        resultados.sort(key=lambda r: (_nome_documento(r).casefold(), r["caminho"].casefold()))
+        return resultados[:limite]
 
     def _meta_arquivos(self, caminhos):
         """{caminho: (mtime, tamanho)} - consulta em lotes (limite de parametros do SQLite)."""
@@ -861,45 +912,103 @@ def _limpar(t):
     return re.sub(r"\s+", " ", t or "").strip()
 
 
-def montar_consulta(termo: str) -> str:
-    """Converte o texto digitado em consulta FTS5 segura (sem operadores do usuario)."""
-    termo = (termo or "").strip()
-    if not termo:
-        return ""
-    partes = re.findall(r'"[^"]+"|\S+', termo)
+def analisar_termo(termo: str):
+    """
+    Interpreta o texto digitado. Devolve grupos ligados por OU; cada grupo e uma lista de
+    itens ligados por E: ("prefixo", [palavra]) ou ("frase", [palavras...]).
+    """
     grupos, atual = [], []
-    for p in partes:
+    for p in re.findall(r'"[^"]+"|\S+', (termo or "").strip()):
         if p.upper() in ("OU", "OR"):
             if atual:
                 grupos.append(atual)
             atual = []
             continue
         if p.startswith('"') and p.endswith('"') and len(p) > 2:
-            frase = " ".join(re.findall(r"\w+", p[1:-1], flags=re.UNICODE))
-            if frase:
-                atual.append('"' + frase + '"')
+            palavras = re.findall(r"\w+", p[1:-1], flags=re.UNICODE)
+            if palavras:
+                atual.append(("frase", palavras))
         else:
             for tok in re.findall(r"\w+", p, flags=re.UNICODE):
-                atual.append('"' + tok + '"*')
+                atual.append(("prefixo", [tok]))
     if atual:
         grupos.append(atual)
-    grupos = [g for g in grupos if g]
+    return [g for g in grupos if g]
+
+
+def montar_consulta(termo: str) -> str:
+    """Converte o texto digitado em consulta FTS5 segura (sem operadores do usuario)."""
+    grupos = analisar_termo(termo)
     if not grupos:
         return ""
-    return " OR ".join("(" + " AND ".join(g) + ")" for g in grupos)
+    def item(tipo, palavras):
+        return '"' + " ".join(palavras) + '"' + ("*" if tipo == "prefixo" else "")
+    return " OR ".join("(" + " AND ".join(item(t, p) for t, p in g) + ")" for g in grupos)
+
+
+def _palavras_nome(texto):
+    """Palavras de um nome, sem acento e sem diferenciar maiusculas ("_", "-", "." separam)."""
+    sem_acento = "".join(c for c in unicodedata.normalize("NFKD", texto) if not unicodedata.combining(c))
+    return re.findall(r"[^\W_]+", sem_acento.casefold())
+
+
+def _grupos_nome(termo):
+    """analisar_termo() ja normalizado para comparar com nomes de arquivo."""
+    saida = []
+    for g in analisar_termo(termo):
+        itens = []
+        for tipo, palavras in g:
+            norm = [w for p in palavras for w in _palavras_nome(p)]
+            if norm:
+                itens.append((tipo, norm))
+        if itens:
+            saida.append(itens)
+    return saida
+
+
+def _nome_casa(nome, grupos) -> bool:
+    """True se o nome do arquivo atende a busca (palavra por prefixo; frase exata e em sequencia)."""
+    palavras = _palavras_nome(nome)
+    if not palavras:
+        return False
+
+    def casa(tipo, termos):
+        if tipo == "prefixo":
+            return all(any(w.startswith(t) for w in palavras) for t in termos)
+        n = len(termos)
+        return any(palavras[i:i + n] == termos for i in range(len(palavras) - n + 1))
+
+    return any(all(casa(t, ws) for t, ws in g) for g in grupos)
 
 
 # --------------------------------------------------------------------------
 # Usuarios (login)
 # --------------------------------------------------------------------------
 
+ALFABETO_CODIGO = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"   # sem I, O, 0, 1 (evita confusao ao digitar)
+TAM_CODIGO = 12                                       # ~60 bits: inviavel adivinhar
+
+
+def _normalizar_codigo(codigo):
+    return re.sub(r"[^A-Z0-9]", "", (codigo or "").upper())
+
+
 class Usuarios:
+    """
+    Usuarios locais deste computador. Senhas e codigos de recuperacao sao guardados so
+    como hash PBKDF2 (com sal): nem o programa nem o administrador conseguem le-los.
+    """
     ITERACOES = 200_000
 
     def __init__(self):
         self.con = sqlite3.connect(str(pasta_dados_app() / "usuarios.db"))
         self.con.execute("""CREATE TABLE IF NOT EXISTS usuarios (
             login TEXT PRIMARY KEY, sal BLOB, hash BLOB, admin INTEGER)""")
+        # colunas novas (3.2): senha provisoria e codigo de recuperacao
+        cols = {r[1] for r in self.con.execute("PRAGMA table_info(usuarios)")}
+        for nome, tipo in (("provisoria", "INTEGER DEFAULT 0"), ("rec_sal", "BLOB"), ("rec_hash", "BLOB")):
+            if nome not in cols:
+                self.con.execute(f"ALTER TABLE usuarios ADD COLUMN {nome} {tipo}")
         self.con.commit()
 
     @classmethod
@@ -911,42 +1020,89 @@ class Usuarios:
         if len(senha) < SENHA_MIN:
             raise ValueError(f"A senha precisa ter pelo menos {SENHA_MIN} caracteres.")
 
+    @staticmethod
+    def _aleatorio(n):
+        return "".join(secrets.choice(ALFABETO_CODIGO) for _ in range(n))
+
     def vazio(self):
         return self.con.execute("SELECT COUNT(*) FROM usuarios").fetchone()[0] == 0
 
-    def criar(self, login, senha, admin=False):
+    def criar(self, login, senha=None, admin=False):
+        """Cria o usuario. Sem senha informada, gera uma senha provisoria e a devolve."""
         login = login.strip().lower()
         if not login:
             raise ValueError("Informe um nome de usuário.")
+        provisoria = senha is None
+        if provisoria:
+            senha = self._aleatorio(10)
         self._checar_senha(senha)
         if self.con.execute("SELECT 1 FROM usuarios WHERE login=?", (login,)).fetchone():
             raise ValueError("Já existe um usuário com esse nome.")
         sal = os.urandom(16)
-        self.con.execute("INSERT INTO usuarios VALUES (?,?,?,?)",
-                         (login, sal, self._hash(senha, sal), int(admin)))
+        self.con.execute("INSERT INTO usuarios (login, sal, hash, admin, provisoria) VALUES (?,?,?,?,?)",
+                         (login, sal, self._hash(senha, sal), int(admin), int(provisoria)))
         self.con.commit()
+        return senha if provisoria else None
 
     def validar(self, login, senha):
+        """Devolve {login, admin, provisoria, tem_codigo} se a senha estiver certa; senao None."""
         login = login.strip().lower()
-        r = self.con.execute("SELECT sal, hash, admin FROM usuarios WHERE login=?", (login,)).fetchone()
+        r = self.con.execute("SELECT sal, hash, admin, provisoria, rec_hash FROM usuarios WHERE login=?",
+                             (login,)).fetchone()
         if r:
             if hmac.compare_digest(self._hash(senha, r[0]), r[1]):
-                return {"login": login, "admin": bool(r[2])}
+                return {"login": login, "admin": bool(r[2]), "provisoria": bool(r[3]), "tem_codigo": bool(r[4])}
         else:
             # mesmo custo de tempo para usuario inexistente (nao revela quais logins existem)
             self._hash(senha, b"\0" * 16)
         return None
 
     def listar(self):
-        return self.con.execute("SELECT login, admin FROM usuarios ORDER BY login").fetchall()
+        """[(login, admin, provisoria)]"""
+        return self.con.execute(
+            "SELECT login, admin, COALESCE(provisoria, 0) FROM usuarios ORDER BY login").fetchall()
 
     def remover(self, login):
         self.con.execute("DELETE FROM usuarios WHERE login=?", (login,))
         self.con.commit()
 
-    def trocar_senha(self, login, nova):
+    def trocar_senha(self, login, nova, provisoria=False):
         self._checar_senha(nova)
         sal = os.urandom(16)
-        self.con.execute("UPDATE usuarios SET sal=?, hash=? WHERE login=?",
-                         (sal, self._hash(nova, sal), login))
+        self.con.execute("UPDATE usuarios SET sal=?, hash=?, provisoria=? WHERE login=?",
+                         (sal, self._hash(nova, sal), int(provisoria), login))
         self.con.commit()
+
+    def redefinir(self, login):
+        """Administrador: gera uma senha provisoria. O usuario sera obrigado a troca-la no proximo acesso."""
+        senha = self._aleatorio(10)
+        self.trocar_senha(login, senha, provisoria=True)
+        return senha
+
+    # ---- codigo de recuperacao ---------------------------------------------
+
+    def gerar_codigo(self, login):
+        """Cria um codigo de recuperacao novo (o anterior deixa de valer). Exibir uma unica vez."""
+        bruto = self._aleatorio(TAM_CODIGO)
+        sal = os.urandom(16)
+        self.con.execute("UPDATE usuarios SET rec_sal=?, rec_hash=? WHERE login=?",
+                         (sal, self._hash(bruto, sal), login))
+        self.con.commit()
+        return "-".join(bruto[i:i + 4] for i in range(0, TAM_CODIGO, 4))
+
+    def recuperar(self, login, codigo, nova):
+        """
+        "Esqueci minha senha": com o codigo certo, define a nova senha e devolve um NOVO
+        codigo (cada codigo vale uma vez). Codigo ou usuario errado: devolve None.
+        """
+        self._checar_senha(nova)
+        login = login.strip().lower()
+        cod = _normalizar_codigo(codigo)
+        r = self.con.execute("SELECT rec_sal, rec_hash FROM usuarios WHERE login=?", (login,)).fetchone()
+        if not r or not r[0] or not r[1]:
+            self._hash(cod, b"\0" * 16)          # mesmo custo de tempo: nao revela se o usuario existe
+            return None
+        if len(cod) != TAM_CODIGO or not hmac.compare_digest(self._hash(cod, r[0]), r[1]):
+            return None
+        self.trocar_senha(login, nova, provisoria=False)
+        return self.gerar_codigo(login)

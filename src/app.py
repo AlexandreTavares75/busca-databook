@@ -201,7 +201,7 @@ def extrair_do_zip(caminho_zip, interno, destino_dir):
     Usa so o nome-base do membro: um zip malicioso nao consegue gravar fora de destino_dir."""
     partes = interno.split(core.SEP_ZIP)
     dados = None
-    zf = zipfile.ZipFile(caminho_zip)
+    zf = zipfile.ZipFile(core.caminho_longo(caminho_zip))
     try:
         for i, parte in enumerate(partes):
             membro = next((m for m in zf.infolist() if core._corrigir_nome_zip(m) == parte), None)
@@ -1166,7 +1166,8 @@ class App:
         self._iniciar_tarefa("indexar_auto" if automatico else "indexar", cancelavel=True)
         if automatico:
             self.lbl_status.config(text="Verificando arquivos novos em segundo plano (a busca continua liberada)...")
-        args = (pasta, self.var_ocr.get(), self.var_nuvem.get())
+        # manual: tenta de novo os arquivos que deram erro; automatico: so o que mudou
+        args = (pasta, self.var_ocr.get(), self.var_nuvem.get(), not automatico)
         threading.Thread(target=self._tarefa_indexar, args=args, daemon=True).start()
 
     def refazer_indice(self):
@@ -1187,13 +1188,14 @@ class App:
         self.indice_busca = core.Indice(pasta)
         self.atualizar_indice()
 
-    def _tarefa_indexar(self, pasta, usar_ocr, liberar_nuvem):
+    def _tarefa_indexar(self, pasta, usar_ocr, liberar_nuvem, tentar_erros=False):
         idx = core.Indice(pasta)
         try:
             r = idx.atualizar(usar_ocr=usar_ocr,
                               progresso=lambda m, i, n: self.fila.put(("prog", m, i, n)),
                               cancelado=self.cancelar_flag.is_set,
-                              liberar_nuvem=liberar_nuvem)
+                              liberar_nuvem=liberar_nuvem,
+                              tentar_erros=tentar_erros)
             self.fila.put(("fim", r))
         except Exception as e:
             log.exception("Erro ao indexar %s", pasta)
@@ -1273,8 +1275,20 @@ class App:
             messagebox.showinfo(APP_NOME, "Nenhum arquivo com erro de leitura.")
             return
         w = tk.Toplevel(self.root)
-        w.title("Arquivos que não puderam ser lidos")
-        w.geometry("900x400")
+        w.title(f"Arquivos que não puderam ser lidos ({len(erros)})")
+        w.geometry("900x440")
+        barra = ttk.Frame(w, padding=8)
+        barra.pack(side="bottom", fill="x")
+
+        def tentar():
+            w.destroy()
+            self.atualizar_indice()      # a atualizacao manual rele os arquivos com erro
+
+        ttk.Button(barra, text="Tentar ler novamente", command=tentar,
+                   state="disabled" if self.trabalhando else "normal").pack(side="left")
+        ttk.Label(barra, foreground="#555",
+                  text="Lê de novo só estes arquivos (e os novos ou alterados).").pack(side="left", padx=10)
+        ttk.Button(barra, text="Fechar", command=w.destroy).pack(side="right")
         t = tk.Text(w, wrap="none")
         t.pack(fill="both", expand=True)
         for c, s in erros:
@@ -1488,7 +1502,7 @@ class App:
             if not self._permitido(r):
                 continue
             try:
-                if not os.path.exists(r["caminho"]):
+                if not os.path.exists(core.caminho_longo(r["caminho"])):
                     messagebox.showwarning(APP_NOME, f"Arquivo não encontrado (movido ou apagado?):\n{r['caminho']}\n\n"
                                            "Atualize o índice.")
                     continue
@@ -1496,7 +1510,7 @@ class App:
                     d = tempfile.mkdtemp(dir=self.temp_dir)
                     abrir_no_sistema(extrair_do_zip(r["caminho"], r["interno"], d))
                 else:
-                    abrir_no_sistema(r["caminho"])
+                    abrir_no_sistema(core.caminho_para_abrir(r["caminho"]))
             except Exception as e:
                 log.warning("Falha ao abrir %s", r["caminho"], exc_info=True)
                 messagebox.showerror(APP_NOME, f"Não foi possível abrir:\n{r['caminho']}\n\n{e}")
@@ -1541,7 +1555,7 @@ class App:
                     while os.path.exists(alvo):
                         alvo = f"{base} ({n}){ext}"
                         n += 1
-                    shutil.copy2(r["caminho"], alvo)
+                    shutil.copy2(core.caminho_longo(r["caminho"]), alvo)
                 ok += 1
             except Exception as e:
                 falhas.append(f"{r['nome']}: {e}")

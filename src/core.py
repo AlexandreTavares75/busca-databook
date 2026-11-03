@@ -8,6 +8,7 @@ minusculas ou acentos ("trafo" encontra "TRAFO", "Trafô", "trafos"...).
 
 import hashlib
 import hmac
+import html
 import io
 import logging
 import os
@@ -59,6 +60,42 @@ _ATR_UNPINNED = 0x100000               # "Liberar espaco"
 _ATR_RECALL_ON_DATA_ACCESS = 0x400000
 _ATR_NUVEM = _ATR_OFFLINE | _ATR_RECALL_ON_OPEN | _ATR_RECALL_ON_DATA_ACCESS
 _ATR_GRAVAVEIS = 0x1 | 0x2 | 0x4 | 0x20 | 0x100 | 0x2000   # somente leitura, oculto, sistema...
+
+
+def caminho_longo(p) -> str:
+    """
+    Caminho que o Windows aceita mesmo com mais de 260 caracteres (prefixo \\\\?\\).
+    Databooks em rede costumam passar desse limite; sem isso, o arquivo e listado mas
+    "nao encontrado" ao abrir. Fora do Windows, devolve o caminho como esta.
+    """
+    p = str(p)
+    if os.name != "nt" or p.startswith("\\\\?\\"):
+        return p
+    p = os.path.abspath(p)
+    if p.startswith("\\\\"):                       # \\servidor\pasta -> \\?\UNC\servidor\pasta
+        return "\\\\?\\UNC\\" + p[2:]
+    return "\\\\?\\" + p
+
+
+def caminho_para_abrir(p) -> str:
+    """Caminho para entregar ao Windows ao abrir um arquivo com o programa padrao.
+    Acima de ~250 caracteres, usa o nome curto (8.3) quando o disco oferece."""
+    p = str(p)
+    if os.name != "nt" or len(p) < 250:
+        return p
+    try:
+        import ctypes
+        buf = ctypes.create_unicode_buffer(32768)
+        if ctypes.windll.kernel32.GetShortPathNameW(caminho_longo(p), buf, len(buf)):
+            curto = buf.value
+            if curto.startswith("\\\\?\\UNC\\"):
+                curto = "\\\\" + curto[8:]
+            elif curto.startswith("\\\\?\\"):
+                curto = curto[4:]
+            return curto
+    except Exception:
+        log.debug("Nome curto indisponível para %s", p, exc_info=True)
+    return caminho_longo(p)
 
 
 def pasta_dados_app() -> Path:
@@ -125,8 +162,14 @@ def _ocr_imagem(img) -> str:
 # --------------------------------------------------------------------------
 
 def _abrir(fonte):
-    """Aceita caminho (str/Path) ou bytes; devolve algo que as libs leem."""
-    return io.BytesIO(fonte) if isinstance(fonte, (bytes, bytearray)) else fonte
+    """
+    Entrega o CONTEUDO do arquivo as bibliotecas (nao o nome): assim um .xls que na
+    verdade e .xlsx e aceito, e caminhos longos do Windows funcionam.
+    """
+    if isinstance(fonte, (bytes, bytearray)):
+        return io.BytesIO(fonte)
+    with open(caminho_longo(fonte), "rb") as f:
+        return io.BytesIO(f.read())
 
 
 def ler_docx(fonte) -> str:
@@ -167,10 +210,7 @@ def ler_xls(fonte) -> str:
         import xlrd
     except ImportError:
         return ler_binario_legado(fonte)
-    if isinstance(fonte, (bytes, bytearray)):
-        wb = xlrd.open_workbook(file_contents=bytes(fonte))
-    else:
-        wb = xlrd.open_workbook(str(fonte))
+    wb = xlrd.open_workbook(file_contents=_ler_bytes(fonte))
     partes = []
     for sh in wb.sheets():
         partes.append(f"[Aba: {sh.name}]")
@@ -199,26 +239,78 @@ def ler_pptx(fonte) -> str:
     return "\n".join(partes)
 
 
+ASSINATURAS_IMAGEM = (b"\xff\xd8\xff", b"\x89PNG", b"II*\x00", b"MM\x00*", b"BM", b"GIF8")
+
+
+def _ler_bytes(fonte) -> bytes:
+    if isinstance(fonte, (bytes, bytearray)):
+        return bytes(fonte)
+    with open(caminho_longo(fonte), "rb") as f:   # Python le caminhos longos; o PDFium nao
+        return f.read()
+
+
+def ler_imagem(fonte, usar_ocr=True, progresso=None) -> str:
+    """Imagem (inclusive salva com extensao .pdf): texto so por OCR."""
+    if not (usar_ocr and configurar_ocr()):
+        return ""
+    from PIL import Image, ImageSequence
+    partes = []
+    with Image.open(io.BytesIO(_ler_bytes(fonte))) as img:
+        for i, quadro in enumerate(ImageSequence.Iterator(img)):     # TIFF com varias paginas
+            if i >= OCR_MAX_PAGINAS:
+                break
+            if progresso:
+                progresso(f"OCR imagem {i + 1}")
+            partes.append(_ocr_imagem(quadro.convert("RGB")))
+    return "\n".join(partes)
+
+
 def ler_pdf(fonte, usar_ocr=True, progresso=None) -> str:
-    """Le o texto do PDF. Paginas sem texto (escaneadas) passam por OCR."""
+    """
+    Le o texto do PDF. Paginas sem texto (escaneadas) passam por OCR.
+    Tolerante a defeitos comuns: lixo antes do cabecalho %PDF, imagem salva como .pdf,
+    paginas que nao abrem ou OCR que falha numa pagina (pula so aquela pagina).
+    """
     import pypdfium2 as pdfium
-    dados = bytes(fonte) if isinstance(fonte, (bytes, bytearray)) else str(fonte)
+    dados = _ler_bytes(fonte)
+    if not dados.startswith(b"%PDF"):
+        if dados.startswith(ASSINATURAS_IMAGEM):
+            return ler_imagem(dados, usar_ocr, progresso)
+        inicio = dados.find(b"%PDF", 0, 1024 * 1024)
+        if inicio > 0:
+            dados = dados[inicio:]
+        elif not dados.strip():
+            raise ValueError("arquivo vazio")
     pdf = pdfium.PdfDocument(dados)
     partes = []
     ocr_feitas = 0
     try:
         for i in range(len(pdf)):
-            pag = pdf[i]
-            tp = pag.get_textpage()
-            texto = tp.get_text_range() or ""
-            tp.close()
-            if len(texto.strip()) < 20 and usar_ocr and ocr_feitas < OCR_MAX_PAGINAS and configurar_ocr():
-                if progresso:
-                    progresso(f"OCR página {i + 1}")
-                img = pag.render(scale=OCR_DPI / 72).to_pil()
-                texto = _ocr_imagem(img)
-                ocr_feitas += 1
-            pag.close()
+            try:
+                pag = pdf[i]
+            except Exception as e:
+                log.info("Página %d ignorada: %s", i + 1, e)
+                partes.append(f"[Página {i + 1}]")
+                continue
+            try:
+                texto = ""
+                try:
+                    tp = pag.get_textpage()
+                    texto = tp.get_text_range() or ""
+                    tp.close()
+                except Exception:
+                    pass
+                if len(texto.strip()) < 20 and usar_ocr and ocr_feitas < OCR_MAX_PAGINAS and configurar_ocr():
+                    if progresso:
+                        progresso(f"OCR página {i + 1}")
+                    try:
+                        img = pag.render(scale=OCR_DPI / 72).to_pil()
+                        texto = _ocr_imagem(img)
+                    except Exception as e:
+                        log.info("OCR falhou na página %d: %s", i + 1, e)
+                    ocr_feitas += 1
+            finally:
+                pag.close()
             partes.append(f"[Página {i + 1}]\n{texto}")
     finally:
         pdf.close()
@@ -226,7 +318,7 @@ def ler_pdf(fonte, usar_ocr=True, progresso=None) -> str:
 
 
 def ler_texto(fonte) -> str:
-    dados = fonte if isinstance(fonte, (bytes, bytearray)) else Path(fonte).read_bytes()
+    dados = _ler_bytes(fonte)
     txt = ""
     for enc in ("utf-8", "cp1252", "latin-1"):
         try:
@@ -249,7 +341,10 @@ def ler_doc(fonte) -> str:
             word = win32com.client.DispatchEx("Word.Application")
             word.Visible = False
             try:
-                d = word.Documents.Open(str(fonte), ReadOnly=True, AddToRecentFiles=False)
+                alvo = str(fonte)
+                if alvo.startswith("\\\\?\\") and len(alvo) < 264:   # Word nao aceita o prefixo \\?\\
+                    alvo = alvo[4:]
+                d = word.Documents.Open(alvo, ReadOnly=True, AddToRecentFiles=False)
                 txt = d.Content.Text
                 d.Close(False)
                 return txt
@@ -262,7 +357,7 @@ def ler_doc(fonte) -> str:
 
 def ler_binario_legado(fonte) -> str:
     """Extrai trechos de texto legiveis de arquivos binarios antigos (.doc/.xls)."""
-    dados = fonte if isinstance(fonte, (bytes, bytearray)) else Path(fonte).read_bytes()
+    dados = _ler_bytes(fonte)
     trechos = []
     for m in re.finditer(rb"(?:[\x20-\x7e\xc0-\xff]\x00){4,}", dados):   # UTF-16LE
         trechos.append(m.group().decode("utf-16le", "ignore"))
@@ -281,20 +376,87 @@ LEITORES = {
 }
 
 
+def ler_ooxml_bruto(fonte) -> str:
+    """
+    Reserva para Word/Excel/PowerPoint (docx/xlsx/pptx) que a biblioteca normal recusa
+    (arquivo com pequenos defeitos ou recursos incomuns): le o texto direto dos XML do
+    pacote, ignorando as partes danificadas.
+    """
+    dados = _ler_bytes(fonte)
+    partes = []
+    with zipfile.ZipFile(io.BytesIO(dados)) as z:
+        for info in z.infolist():
+            n = info.filename.lower()
+            if not n.endswith(".xml") or not n.startswith(("word/", "xl/", "ppt/")):
+                continue
+            if "/theme" in n or "/styles" in n or "/_rels" in n or n.endswith("settings.xml"):
+                continue
+            try:
+                xml = z.read(info).decode("utf-8", "ignore")
+            except Exception:
+                continue                       # parte danificada: segue com as demais
+            texto = html.unescape(re.sub(r"<[^>]+>", " ", xml))
+            texto = re.sub(r"\s+", " ", texto).strip()
+            if texto:
+                partes.append(texto)
+    if not partes:
+        raise ValueError("nenhum texto legível no pacote do Office")
+    return "\n".join(partes)
+
+
+def _cabecalho(fonte, n=8) -> bytes:
+    if isinstance(fonte, (bytes, bytearray)):
+        return bytes(fonte[:n])
+    with open(caminho_longo(fonte), "rb") as f:
+        return f.read(n)
+
+
+def _formato_real(ext, cab):
+    """Corrige a extensao pelo conteudo: ex. .xls que na verdade e .xlsx, .docx que e .doc."""
+    zip_ = cab.startswith(b"PK\x03\x04")
+    ole = cab.startswith(b"\xd0\xcf\x11\xe0")
+    familias = ((".xls", ".xlsx", ".xlsm"), (".doc", ".docx", ".docm"), (".pptx", ".pptm"))
+    for fam in familias:
+        if ext in fam:
+            if zip_:
+                return {".xls": ".xlsx", ".doc": ".docx"}.get(ext, ext)
+            if ole:
+                return {".xlsx": ".xls", ".xlsm": ".xls", ".docx": ".doc", ".docm": ".doc"}.get(ext, ext)
+    if ext == ".pdf" and cab.startswith(ASSINATURAS_IMAGEM):
+        return ".imagem"
+    return ext
+
+
 def extrair(nome: str, fonte, usar_ocr=True, progresso=None, profundidade=0):
     """
     Devolve lista de tuplas (subcaminho_no_zip_ou_vazio, texto).
     Para arquivos normais e uma lista com um item; para zip, um por membro.
     """
     ext = os.path.splitext(nome)[1].lower()
-    if ext == ".zip":
-        return _extrair_zip(fonte, usar_ocr, progresso, profundidade)
     if ext not in EXT_CONTEUDO:
         return [("", "")]
+    ext = _formato_real(ext, _cabecalho(fonte))
+    if ext == ".zip":
+        return _extrair_zip(fonte, usar_ocr, progresso, profundidade)
     if ext == ".pdf":
         return [("", ler_pdf(fonte, usar_ocr, progresso))]
+    if ext == ".imagem":
+        return [("", ler_imagem(fonte, usar_ocr, progresso))]
     leitor = LEITORES.get(ext, ler_texto)
-    return [("", leitor(fonte))]
+    try:
+        return [("", leitor(fonte))]
+    except Exception as erro:
+        # reservas: Office moderno danificado -> XML bruto; Excel/Word antigo -> texto bruto
+        if ext in (".docx", ".docm", ".xlsx", ".xlsm", ".pptx", ".pptm"):
+            try:
+                return [("", ler_ooxml_bruto(fonte))]
+            except Exception:
+                raise erro
+        if ext in (".xls", ".doc"):
+            texto = ler_binario_legado(_ler_bytes(fonte))
+            if texto.strip():
+                return [("", texto)]
+        raise
 
 
 def _extrair_zip(fonte, usar_ocr, progresso, profundidade):
@@ -461,7 +623,7 @@ class Indice:
                 break
             pasta = pilha.pop()
             try:
-                with os.scandir(pasta) as it:
+                with os.scandir(caminho_longo(pasta)) as it:   # pastas profundas (> 260 caracteres)
                     entradas = list(it)
             except OSError:
                 falhas += 1
@@ -471,9 +633,10 @@ class Indice:
             for e in entradas:
                 nome = e.name
                 try:
+                    caminho = os.path.join(pasta, nome)              # guardado sem o prefixo \\?\\
                     if e.is_dir(follow_symlinks=False):
                         if not nome.startswith(("~", "$", ".")):   # ignora pastas ocultas/sistema
-                            subpastas.append(e.path)
+                            subpastas.append(caminho)
                         continue
                     if nome.startswith("~$"):                       # temporario do Office
                         continue
@@ -481,18 +644,20 @@ class Indice:
                 except OSError:
                     falhas += 1
                     continue
-                no_disco[e.path] = (st.st_mtime, st.st_size)
+                no_disco[caminho] = (st.st_mtime, st.st_size)
                 if so_na_nuvem(st):
-                    nuvem.add(e.path)
+                    nuvem.add(caminho)
             pilha.extend(sorted(subpastas, key=str.casefold, reverse=True))  # ordem alfabetica
             avisar(f"Listando arquivos... {len(no_disco)}")
         return no_disco, nuvem, falhas
 
-    def atualizar(self, usar_ocr=True, progresso=None, cancelado=lambda: False, liberar_nuvem=True):
+    def atualizar(self, usar_ocr=True, progresso=None, cancelado=lambda: False, liberar_nuvem=True,
+                  tentar_erros=False):
         """
         Varre a pasta e (re)indexa so o que mudou.
         progresso(msg, atual, total) e chamado periodicamente.
         liberar_nuvem: arquivos que estavam so no OneDrive voltam para a nuvem depois de lidos.
+        tentar_erros: le de novo tambem os arquivos que deram erro antes (mesmo sem mudanca).
         Devolve dict com contagens.
         """
         def avisar(msg, i=0, n=0):
@@ -514,6 +679,10 @@ class Indice:
         # um arquivo "sumido" pode estar apenas inacessivel naquele momento.
         removidos = [] if falhas else [p for p in no_indice if p not in no_disco]
         novos = [p for p, mt in no_disco.items() if _mudou(no_indice.get(p), mt)]
+        if tentar_erros:
+            ja = set(novos)
+            novos += [p for (p,) in self.con.execute("SELECT caminho FROM arquivos WHERE status LIKE 'erro%'")
+                      if p in no_disco and p not in ja]
 
         for p in removidos:
             self._remover(p)
@@ -536,14 +705,14 @@ class Indice:
                     partes = [("", "")]
                     status = "grande"
                 else:
-                    partes = extrair(nome, p, usar_ocr,
+                    partes = extrair(nome, caminho_longo(p), usar_ocr,
                                      lambda m, _n=nome, _i=i: avisar(f"{_n}: {m}", _i, total))
             except Exception as e:
                 partes = [("", "")]
                 status = f"erro: {type(e).__name__}: {e}"[:300]
                 erros += 1
             # so devolve a nuvem o que estava na nuvem antes e foi baixado para leitura
-            if liberar_nuvem and leu_conteudo and p in nuvem and liberar_espaco(p):
+            if liberar_nuvem and leu_conteudo and p in nuvem and liberar_espaco(caminho_longo(p)):
                 liberados += 1
             self._remover(p)
             nome_busca = _nome_pesquisavel(p, self.raiz)

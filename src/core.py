@@ -48,7 +48,31 @@ OCR_MAX_PAGINAS = 200         # limite de paginas escaneadas por PDF
 SEP_ZIP = " >> "              # separador entre o zip e o arquivo interno
 
 PREFIXO_EMPRESA = "DB_"       # pastas "DB_NOME" na pasta principal viram empresas
-SENHA_MIN = 6                 # vale para senhas novas; senhas antigas continuam aceitas
+SENHA_MIN = 8                 # senhas novas; senhas antigas fora da regra sao trocadas no proximo login
+REGRAS_SENHA = (f"Mínimo de {SENHA_MIN} caracteres, com letra maiúscula,\n"
+                "letra minúscula, número e caractere especial (ex.: ! @ # $ % & *).")
+
+
+def problemas_senha(senha, login=""):
+    """Lista o que falta para a senha atender a regra (lista vazia = senha aceita)."""
+    faltam = []
+    if len(senha) < SENHA_MIN:
+        faltam.append(f"ter pelo menos {SENHA_MIN} caracteres")
+    if not any(c.isupper() for c in senha):
+        faltam.append("ter uma letra maiúscula")
+    if not any(c.islower() for c in senha):
+        faltam.append("ter uma letra minúscula")
+    if not any(c.isdigit() for c in senha):
+        faltam.append("ter um número")
+    if not any(not c.isalnum() and not c.isspace() for c in senha):
+        faltam.append("ter um caractere especial (ex.: ! @ # $ % & *)")
+    if login and len(login.strip()) >= 3 and login.strip().lower() in senha.lower():
+        faltam.append("não conter o nome de usuário")
+    return faltam
+
+
+def senha_forte(senha, login=""):
+    return not problemas_senha(senha, login)
 
 FORMATO_EXPORTACAO = "buscadatabook-indice/1"
 EXT_EXPORTACAO = ".bdx"
@@ -1371,9 +1395,10 @@ class Usuarios:
         return hashlib.pbkdf2_hmac("sha256", senha.encode("utf-8"), sal, cls.ITERACOES)
 
     @staticmethod
-    def _checar_senha(senha):
-        if len(senha) < SENHA_MIN:
-            raise ValueError(f"A senha precisa ter pelo menos {SENHA_MIN} caracteres.")
+    def _checar_senha(senha, login=""):
+        faltam = problemas_senha(senha, login)
+        if faltam:
+            raise ValueError("A senha precisa:\n- " + "\n- ".join(faltam))
 
     @staticmethod
     def _aleatorio(n):
@@ -1389,8 +1414,9 @@ class Usuarios:
             raise ValueError("Informe um nome de usuário.")
         provisoria = senha is None
         if provisoria:
-            senha = self._aleatorio(10)
-        self._checar_senha(senha)
+            senha = self._aleatorio(10)           # aleatoria e de uso unico: troca obrigatoria no 1o acesso
+        else:
+            self._checar_senha(senha, login)
         if self.con.execute("SELECT 1 FROM usuarios WHERE login=?", (login,)).fetchone():
             raise ValueError("Já existe um usuário com esse nome.")
         sal = os.urandom(16)
@@ -1422,7 +1448,8 @@ class Usuarios:
         self.con.commit()
 
     def trocar_senha(self, login, nova, provisoria=False):
-        self._checar_senha(nova)
+        if not provisoria:                         # provisoria: gerada pelo programa (redefinir)
+            self._checar_senha(nova, login)
         sal = os.urandom(16)
         self.con.execute("UPDATE usuarios SET sal=?, hash=?, provisoria=? WHERE login=?",
                          (sal, self._hash(nova, sal), int(provisoria), login))
@@ -1450,8 +1477,8 @@ class Usuarios:
         "Esqueci minha senha": com o codigo certo, define a nova senha e devolve um NOVO
         codigo (cada codigo vale uma vez). Codigo ou usuario errado: devolve None.
         """
-        self._checar_senha(nova)
         login = login.strip().lower()
+        self._checar_senha(nova, login)
         cod = _normalizar_codigo(codigo)
         r = self.con.execute("SELECT rec_sal, rec_hash FROM usuarios WHERE login=?", (login,)).fetchone()
         if not r or not r[0] or not r[1]:

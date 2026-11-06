@@ -1,10 +1,21 @@
-BUSCA DATABOOK 3.3
+BUSCA DATABOOK 3.4
 ==================
 
 Programa para Windows que procura uma palavra (ex.: "Trafo") dentro dos
 documentos de uma pasta e de todas as suas subpastas: no PC, na rede
 (ex.: \\servidor\projetos ou uma unidade mapeada) ou na nuvem sincronizada
 (OneDrive, Google Drive para computador, SharePoint sincronizado).
+
+
+NOVIDADES DA 3.4
+----------------
+- Senhas mais fortes (obrigatório): mínimo de 8 caracteres, com letra
+  maiúscula, letra minúscula, número e caractere especial, sem conter o
+  nome de usuário. Quem tem senha antiga fora da regra é obrigado a
+  criar uma nova no próximo login.
+- Resultados com rolagem para os lados: a coluna Pasta se alarga até
+  caber o endereço inteiro; use a barra de baixo ou Shift + roda do
+  mouse. Também vale na janela "Cópias e versões".
 
 
 NOVIDADES DA 3.3

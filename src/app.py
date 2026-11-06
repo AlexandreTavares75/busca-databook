@@ -22,6 +22,7 @@ from pathlib import Path
 import tkinter as tk
 from logging.handlers import RotatingFileHandler
 from tkinter import ttk, filedialog, messagebox, simpledialog
+import tkinter.font as tkfont
 
 import core
 import updater
@@ -58,6 +59,35 @@ def _luminancia(cor):
         return v / 12.92 if v <= 0.03928 else ((v + 0.055) / 1.055) ** 2.4
     r, g, b = (int(cor[i:i + 2], 16) for i in (1, 3, 5))
     return 0.2126 * canal(r) + 0.7152 * canal(g) + 0.0722 * canal(b)
+
+
+def rolagem_lateral(tv):
+    """Shift + roda do mouse rola a lista para os lados (a barra horizontal tambem funciona)."""
+    def rolar(e):
+        tv.xview_scroll(-3 if e.delta > 0 else 3, "units")
+        return "break"
+    tv.bind("<Shift-MouseWheel>", rolar)
+
+
+def ajustar_ultima_coluna(tv, col, textos, minimo=200, maximo=4000):
+    """Alarga a coluna `col` ate caber o texto mais longo (ex.: o caminho da pasta), para a
+    barra de rolagem horizontal mostrar o endereco inteiro. Sem texto longo, a coluna ocupa
+    o espaco que sobra na janela."""
+    fonte = tkfont.nametofont("TkDefaultFont")
+    maior = max((fonte.measure(t) for t in textos[:3000]), default=0) + 24
+    outras = sum(tv.column(c, "width") for c in ("#0",) + tuple(tv["columns"]) if c != col)
+    sobra = tv.winfo_width() - outras - 4
+    tv.column(col, width=max(minimo, min(maximo, max(maior, sobra))), stretch=False)
+    tv._largura_conteudo = maior            # usado ao redimensionar a janela
+
+
+def manter_ultima_coluna(tv, col, minimo=200, maximo=4000):
+    """Ao redimensionar a janela, recalcula a coluna `col` (preenche o espaco ou cabe o texto)."""
+    def ao_mudar(_e=None):
+        outras = sum(tv.column(c, "width") for c in ("#0",) + tuple(tv["columns"]) if c != col)
+        sobra = tv.winfo_width() - outras - 4
+        tv.column(col, width=max(minimo, min(maximo, max(getattr(tv, "_largura_conteudo", 0), sobra))))
+    tv.bind("<Configure>", ao_mudar, add="+")
 
 
 def aplicar_tema(marca):
@@ -302,7 +332,9 @@ class TelaLogin(tk.Toplevel):
             ttk.Label(f, text="Confirmar senha:").grid(row=4, column=0, sticky="e", padx=4, pady=4)
             self.e_senha2 = ttk.Entry(f, width=28, show="•")
             self.e_senha2.grid(row=4, column=1, pady=4)
-            linha = 5
+            ttk.Label(f, text=core.REGRAS_SENHA, foreground="#666", justify="left").grid(
+                row=5, column=0, columnspan=2, sticky="w", pady=(4, 0))
+            linha = 6
 
         b = ttk.Frame(f)
         b.grid(row=linha, column=0, columnspan=2, pady=(12, 0))
@@ -383,6 +415,15 @@ class TelaLogin(tk.Toplevel):
                 self.e_senha.delete(0, "end")
                 return
             r["provisoria"] = False
+        elif not core.senha_forte(senha, r["login"]):
+            # senha criada antes da regra atual (3.4): troca obrigatoria antes de entrar
+            tela = TelaNovaSenha(self, self.usuarios, r["login"], obrigatoria=True,
+                                 motivo="Sua senha não atende às novas regras de segurança.")
+            self.wait_window(tela)
+            if not tela.ok:
+                self.e_senha.delete(0, "end")
+                return
+            log.info("Senha fora da regra trocada no login: %s", r["login"])
         if not r["tem_codigo"]:
             # todo usuario recebe um codigo de recuperacao (inclusive os que ja existiam)
             mostrar_codigo(self, self.usuarios.gerar_codigo(r["login"]))
@@ -405,15 +446,19 @@ class TelaLogin(tk.Toplevel):
 class TelaNovaSenha(tk.Toplevel):
     """Cria uma senha nova. obrigatoria=True: primeiro acesso com senha provisoria."""
 
-    def __init__(self, master, usuarios, login, obrigatoria=False):
+    def __init__(self, master, usuarios, login, obrigatoria=False, motivo=None):
         super().__init__(master)
         self.usuarios, self.login, self.ok = usuarios, login, False
         self.title("Criar nova senha")
         self.resizable(False, False)
         f = ttk.Frame(self, padding=18)
         f.pack(fill="both", expand=True)
-        msg = (f"Olá, {login}. Sua senha atual é provisória.\nCrie agora a sua senha pessoal para continuar."
-               if obrigatoria else f"Nova senha para {login}.")
+        if motivo:
+            msg = f"Olá, {login}. {motivo}\nCrie agora uma nova senha para continuar."
+        elif obrigatoria:
+            msg = f"Olá, {login}. Sua senha atual é provisória.\nCrie agora a sua senha pessoal para continuar."
+        else:
+            msg = f"Nova senha para {login}."
         ttk.Label(f, text=msg, justify="left").grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 10))
         ttk.Label(f, text="Nova senha:").grid(row=1, column=0, sticky="e", padx=4, pady=4)
         self.e1 = ttk.Entry(f, width=28, show="•")
@@ -421,8 +466,8 @@ class TelaNovaSenha(tk.Toplevel):
         ttk.Label(f, text="Repita a senha:").grid(row=2, column=0, sticky="e", padx=4, pady=4)
         self.e2 = ttk.Entry(f, width=28, show="•")
         self.e2.grid(row=2, column=1, pady=4)
-        ttk.Label(f, text=f"Mínimo de {core.SENHA_MIN} caracteres.", foreground="#666").grid(
-            row=3, column=1, sticky="w")
+        ttk.Label(f, text=core.REGRAS_SENHA, foreground="#666", justify="left").grid(
+            row=3, column=0, columnspan=2, sticky="w", pady=(4, 0))
         b = ttk.Frame(f)
         b.grid(row=4, column=0, columnspan=2, pady=(12, 0))
         ttk.Button(b, text="Salvar", command=self.salvar).pack(side="left", padx=4)
@@ -522,7 +567,8 @@ class TelaRecuperar(tk.Toplevel):
             e.grid(row=i, column=1, pady=4)
             self.entradas.append(e)
         self.entradas[0].insert(0, login_sugerido.strip())
-        ttk.Label(f, text="Código no formato XXXX-XXXX-XXXX", foreground="#666").grid(row=5, column=1, sticky="w")
+        ttk.Label(f, text="Código no formato XXXX-XXXX-XXXX.\n\nNova senha: " + core.REGRAS_SENHA,
+                  foreground="#666", justify="left").grid(row=5, column=0, columnspan=2, sticky="w", pady=(4, 0))
         b = ttk.Frame(f)
         b.grid(row=6, column=0, columnspan=2, pady=(12, 0))
         ttk.Button(b, text="Criar nova senha", command=self.confirmar).pack(side="left", padx=4)
@@ -860,21 +906,33 @@ class TelaCopias(tk.Toplevel):
         ttk.Label(f, text="★ = exibida na busca (versão mais recente, no caminho mais curto). "
                           "Mesmo tamanho = cópia idêntica; tamanho diferente = outra versão.",
                   foreground="#555").pack(anchor="w", pady=(0, 6))
-        self.tv = ttk.Treeview(f, columns=("data", "tamanho", "pasta"), selectmode="extended")
+        lista = ttk.Frame(f)
+        lista.pack(fill="both", expand=True)
+        self.tv = ttk.Treeview(lista, columns=("data", "tamanho", "pasta"), selectmode="extended")
         self.tv.heading("#0", text="Arquivo")
         self.tv.heading("data", text="Modificado em")
         self.tv.heading("tamanho", text="Tamanho")
         self.tv.heading("pasta", text="Pasta")
-        self.tv.column("#0", width=280)
+        self.tv.column("#0", width=280, stretch=False)
         self.tv.column("data", width=120, anchor="center", stretch=False)
         self.tv.column("tamanho", width=80, anchor="e", stretch=False)
-        self.tv.column("pasta", width=460)
-        self.tv.pack(fill="both", expand=True)
+        self.tv.column("pasta", width=460, stretch=False)
+        sy = ttk.Scrollbar(lista, orient="vertical", command=self.tv.yview)
+        sx = ttk.Scrollbar(lista, orient="horizontal", command=self.tv.xview)
+        self.tv.configure(yscrollcommand=sy.set, xscrollcommand=sx.set)
+        self.tv.grid(row=0, column=0, sticky="nsew")
+        sy.grid(row=0, column=1, sticky="ns")
+        sx.grid(row=1, column=0, sticky="ew")
+        lista.rowconfigure(0, weight=1)
+        lista.columnconfigure(0, weight=1)
+        rolagem_lateral(self.tv)
+        manter_ultima_coluna(self.tv, "pasta", minimo=460)
         for i, r in enumerate(self.itens):
             marca = "★ " if (r["caminho"], r["interno"]) == (principal["caminho"], principal["interno"]) else "    "
             nome = r["nome"] + (f"  ›  {r['interno']}" if r["interno"] else "")
             self.tv.insert("", "end", iid=str(i), text=marca + nome,
                            values=(formatar_data(r.get("mtime")), formatar_tamanho(r.get("tamanho", 0)), r["pasta"]))
+        ajustar_ultima_coluna(self.tv, "pasta", [r["pasta"] for r in self.itens], minimo=460)
         self.tv.bind("<Double-1>", lambda e: self._abrir())
         b = ttk.Frame(f)
         b.pack(fill="x", pady=(8, 0))
@@ -1195,8 +1253,8 @@ class App:
         self.tv.column("tipo", width=55, stretch=False, anchor="center")
         self.tv.column("onde", width=80, stretch=False, anchor="center")
         self.tv.column("copias", width=60, stretch=False, anchor="center")
-        self.tv.column("trecho", width=410)
-        self.tv.column("pasta", width=300)
+        self.tv.column("trecho", width=410, stretch=False)
+        self.tv.column("pasta", width=300, stretch=False)   # alarga ate caber o caminho (ver _mostrar_resultados)
         sy = ttk.Scrollbar(meio, orient="vertical", command=self.tv.yview)
         sx = ttk.Scrollbar(meio, orient="horizontal", command=self.tv.xview)
         self.tv.configure(yscrollcommand=sy.set, xscrollcommand=sx.set)
@@ -1208,6 +1266,8 @@ class App:
         self.tv.bind("<Double-1>", lambda e: self.abrir())
         self.tv.bind("<Return>", lambda e: self.abrir())
         self.tv.bind("<Button-3>", self._menu_contexto)
+        rolagem_lateral(self.tv)
+        manter_ultima_coluna(self.tv, "pasta")
 
         self.menu_ctx = tk.Menu(self.root, tearoff=0)
         self.menu_ctx.add_command(label="Abrir", command=self.abrir)
@@ -1796,6 +1856,8 @@ class App:
             n = len(r.get("copias", ()))
             self.tv.insert("", "end", iid=str(i), text=nome,
                            values=(r["ext"].upper(), r["onde"], str(n) if n > 1 else "", r["trecho"], r["pasta"]))
+        ajustar_ultima_coluna(self.tv, "pasta", [r["pasta"] for r in self.exibidos])
+        self.tv.xview_moveto(0)
         termo = self.var_termo.get().strip()
         if not self.trabalhando and termo:
             onde = self._texto_escopo()

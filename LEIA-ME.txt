@@ -1,10 +1,25 @@
-BUSCA DATABOOK 3.2
+BUSCA DATABOOK 3.3
 ==================
 
 Programa para Windows que procura uma palavra (ex.: "Trafo") dentro dos
 documentos de uma pasta e de todas as suas subpastas: no PC, na rede
 (ex.: \\servidor\projetos ou uma unidade mapeada) ou na nuvem sincronizada
 (OneDrive, Google Drive para computador, SharePoint sincronizado).
+
+
+NOVIDADES DA 3.3
+----------------
+- Pacote do cliente (.bdpack): versão personalizada para cada cliente,
+  com o mesmo instalador.
+  * Arquivo > Criar pacote do cliente (administrador): nome do cliente,
+    cor do menu, logomarca e, se quiser, o índice das empresas escolhidas.
+  * No cliente: instalar o programa e dar dois cliques no .bdpack (ou
+    Arquivo > Importar pacote do cliente). O programa abre com o nome, a
+    cor e a logomarca do cliente, já apontando para a pasta e indexado.
+  * Arquivo > Remover personalização do cliente volta ao padrão.
+  * Com índice, o pacote contém o texto dos documentos: envie só por
+    canal privado. Nunca publique pacotes ou logomarcas de clientes no
+    GitHub (o repositório é público).
 
 
 NOVIDADES DA 3.2

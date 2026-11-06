@@ -38,10 +38,49 @@ BLOQUEIO_LOGIN_S = 30
 
 # Menu lateral
 LARGURA_MENU = 220
-AZUL = "#002060"
+AZUL = "#002060"                 # fundo do menu lateral (muda com a cor do cliente)
 AZUL_TEXTO_SUAVE = "#AFC3E8"
 BOTAO_COR = "#0B3A8C"            # botao em relevo, um tom acima do fundo
 BOTAO_HOVER = "#1A4FA8"
+DESTAQUE = "#002060"             # texto do botao selecionado e do "Buscando em"
+MARCA = None                     # personalizacao do cliente (core.carregar_marca)
+
+
+def _misturar(cor, alvo, fator):
+    c = [int(cor[i:i + 2], 16) for i in (1, 3, 5)]
+    a = [int(alvo[i:i + 2], 16) for i in (1, 3, 5)]
+    return "#%02X%02X%02X" % tuple(round(x + (y - x) * fator) for x, y in zip(c, a))
+
+
+def _luminancia(cor):
+    def canal(v):
+        v /= 255
+        return v / 12.92 if v <= 0.03928 else ((v + 0.055) / 1.055) ** 2.4
+    r, g, b = (int(cor[i:i + 2], 16) for i in (1, 3, 5))
+    return 0.2126 * canal(r) + 0.7152 * canal(g) + 0.0722 * canal(b)
+
+
+def aplicar_tema(marca):
+    """Cores do menu lateral a partir da cor do cliente. Cores claras (ex. laranja) ganham botoes
+    mais escuros para o texto branco continuar legivel; cores escuras, botoes mais claros."""
+    global AZUL, AZUL_TEXTO_SUAVE, BOTAO_COR, BOTAO_HOVER, DESTAQUE, MARCA
+    MARCA = marca
+    cor = (marca or {}).get("cor_menu")
+    if not cor:
+        AZUL, AZUL_TEXTO_SUAVE, BOTAO_COR, BOTAO_HOVER, DESTAQUE = (
+            "#002060", "#AFC3E8", "#0B3A8C", "#1A4FA8", "#002060")
+        return
+    AZUL = cor
+    if _luminancia(cor) > 0.12:                       # cor clara/viva
+        BOTAO_COR = _misturar(cor, "#000000", 0.30)
+        BOTAO_HOVER = _misturar(cor, "#000000", 0.18)
+        AZUL_TEXTO_SUAVE = "#FFFFFF"
+        DESTAQUE = BOTAO_COR
+    else:                                             # cor escura
+        BOTAO_COR = _misturar(cor, "#FFFFFF", 0.12)
+        BOTAO_HOVER = _misturar(cor, "#FFFFFF", 0.22)
+        AZUL_TEXTO_SUAVE = _misturar(cor, "#FFFFFF", 0.65)
+        DESTAQUE = cor
 FONTE_MENU = ("Segoe UI", 10)
 FONTE_MENU_SEL = ("Segoe UI", 10, "bold")
 EMPRESA_DEV = "Omni Solutions Ltda"
@@ -423,7 +462,7 @@ class TelaSegredo(tk.Toplevel):
         f.pack(fill="both", expand=True)
         ttk.Label(f, text=texto, justify="left", wraplength=420).pack(anchor="w")
         caixa = tk.Entry(f, font=("Consolas", 18, "bold"), justify="center", width=18,
-                         relief="solid", bd=1, readonlybackground="#F2F5FB", fg=AZUL)
+                         relief="solid", bd=1, readonlybackground="#F2F5FB", fg=DESTAQUE)
         caixa.insert(0, valor)
         caixa.config(state="readonly")
         caixa.pack(pady=14, ipady=6)
@@ -675,6 +714,137 @@ class TelaExportar(tk.Toplevel):
         self.destroy()
 
 
+class TelaPacote(tk.Toplevel):
+    """Dados do pacote do cliente. resultado = dict ou None."""
+
+    def __init__(self, master, empresas, tem_indice, inicial):
+        super().__init__(master)
+        self.empresas = empresas
+        self.resultado = None
+        self._prev = None
+        self.title("Criar pacote do cliente")
+        self.resizable(False, False)
+        f = ttk.Frame(self, padding=14)
+        f.pack(fill="both", expand=True)
+        f.columnconfigure(1, weight=1)
+
+        ttk.Label(f, text="Nome do cliente:").grid(row=0, column=0, sticky="w", pady=3)
+        self.var_cliente = tk.StringVar(value=inicial.get("cliente", ""))
+        ttk.Entry(f, textvariable=self.var_cliente, width=40).grid(row=0, column=1, columnspan=2, sticky="ew", pady=3)
+
+        ttk.Label(f, text="Cor do menu:").grid(row=1, column=0, sticky="w", pady=3)
+        cores = ttk.Frame(f)
+        cores.grid(row=1, column=1, columnspan=2, sticky="w", pady=3)
+        self.var_cor = tk.StringVar(value=inicial.get("cor", ""))
+        ttk.Entry(cores, textvariable=self.var_cor, width=10).pack(side="left")
+        self.amostra = tk.Label(cores, width=4, relief="solid", bd=1)
+        self.amostra.pack(side="left", padx=6)
+        ttk.Button(cores, text="Escolher...", command=self._escolher_cor).pack(side="left")
+        ttk.Label(cores, text="(vazio = azul padrão)", foreground="#666").pack(side="left", padx=6)
+        self.var_cor.trace_add("write", lambda *a: self._amostra())
+
+        ttk.Label(f, text="Logomarca:").grid(row=2, column=0, sticky="nw", pady=3)
+        self.var_logo = tk.StringVar(value=inicial.get("logo", ""))
+        ttk.Entry(f, textvariable=self.var_logo, width=40).grid(row=2, column=1, sticky="ew", pady=3)
+        ttk.Button(f, text="Escolher...", command=self._escolher_logo).grid(row=2, column=2, padx=(4, 0), pady=3)
+        self.previa = ttk.Label(f)
+        self.previa.grid(row=3, column=1, columnspan=2, sticky="w", pady=(2, 8))
+        self.var_logo.trace_add("write", lambda *a: self._previa_logo())
+
+        self.var_indice = tk.BooleanVar(value=tem_indice)
+        ttk.Checkbutton(f, text="Incluir o índice da pasta principal atual", variable=self.var_indice,
+                        state="normal" if tem_indice else "disabled",
+                        command=self._indice_mudou).grid(row=4, column=0, columnspan=3, sticky="w")
+        caixa = ttk.Frame(f)
+        caixa.grid(row=5, column=0, columnspan=3, sticky="ew", pady=(4, 2))
+        self.lista = tk.Listbox(caixa, selectmode="multiple", height=min(10, max(3, len(empresas))),
+                                exportselection=False, activestyle="none")
+        sb = ttk.Scrollbar(caixa, orient="vertical", command=self.lista.yview)
+        self.lista.configure(yscrollcommand=sb.set)
+        self.lista.pack(side="left", fill="both", expand=True)
+        sb.pack(side="right", fill="y")
+        for nome, _ in empresas:
+            self.lista.insert("end", nome)
+        self.lista.select_set(0, "end")
+        self.var_fora = tk.BooleanVar(value=True)
+        self.chk_fora = ttk.Checkbutton(f, text='Incluir arquivos fora das pastas "DB_"', variable=self.var_fora)
+        self.chk_fora.grid(row=6, column=0, columnspan=3, sticky="w")
+        ttk.Label(f, foreground="#a0522d", wraplength=440, justify="left",
+                  text="⚠ Com o índice, o pacote contém o texto dos documentos. Envie só por canal "
+                       "privado e só a quem tem direito a esse conteúdo. Nunca publique no GitHub."
+                  ).grid(row=7, column=0, columnspan=3, sticky="w", pady=(10, 0))
+        fim = ttk.Frame(f)
+        fim.grid(row=8, column=0, columnspan=3, sticky="e", pady=(12, 0))
+        ttk.Button(fim, text="Criar pacote...", command=self.confirmar).pack(side="left", padx=4)
+        ttk.Button(fim, text="Cancelar", command=self.destroy).pack(side="left")
+        self._amostra()
+        self._previa_logo()
+        self._indice_mudou()
+        self.transient(master)
+        self.grab_set()
+
+    def _escolher_cor(self):
+        from tkinter import colorchooser
+        atual = self.var_cor.get().strip()
+        _, hexa = colorchooser.askcolor(color=atual if core.RE_COR.match(atual) else None, parent=self)
+        if hexa:
+            self.var_cor.set(hexa.upper())
+
+    def _amostra(self):
+        c = self.var_cor.get().strip()
+        self.amostra.config(bg=c if core.RE_COR.match(c) else "#002060")
+
+    def _escolher_logo(self):
+        p = filedialog.askopenfilename(parent=self, title="Logomarca do cliente",
+                                       filetypes=[("Imagens", "*.png *.jpg *.jpeg *.bmp *.gif"), ("Todos", "*.*")])
+        if p:
+            self.var_logo.set(os.path.normpath(p))
+
+    def _previa_logo(self):
+        p = self.var_logo.get().strip()
+        self._prev = None
+        if p and os.path.isfile(p):
+            try:
+                from PIL import Image, ImageTk
+                img = Image.open(p)
+                img.thumbnail((240, 60))
+                self._prev = ImageTk.PhotoImage(img)
+            except Exception:
+                self._prev = None
+        self.previa.config(image=self._prev or "", text="" if self._prev else ("(imagem inválida)" if p else ""))
+
+    def _indice_mudou(self):
+        estado = "normal" if self.var_indice.get() else "disabled"
+        self.lista.config(state=estado)
+        self.chk_fora.config(state=estado)
+
+    def confirmar(self):
+        cliente = self.var_cliente.get().strip()
+        cor = self.var_cor.get().strip().upper()
+        logo = self.var_logo.get().strip()
+        if not cliente:
+            messagebox.showwarning("Pacote do cliente", "Informe o nome do cliente.", parent=self)
+            return
+        if cor and not core.RE_COR.match(cor):
+            messagebox.showwarning("Pacote do cliente", "Cor inválida. Use o formato #RRGGBB, ex.: #FA7C13.", parent=self)
+            return
+        if logo and not os.path.isfile(logo):
+            messagebox.showwarning("Pacote do cliente", "Arquivo da logomarca não encontrado.", parent=self)
+            return
+        pastas, fora = None, True
+        if self.var_indice.get():
+            sel = list(self.lista.curselection())
+            fora = self.var_fora.get()
+            if not sel and not fora:
+                messagebox.showwarning("Pacote do cliente", "Escolha ao menos uma empresa.", parent=self)
+                return
+            if not (len(sel) == len(self.empresas) and fora):
+                pastas = [self.empresas[i][1] for i in sel]
+        self.resultado = {"cliente": cliente, "cor": cor or None, "logo": logo or None,
+                          "incluir_indice": self.var_indice.get(), "pastas": pastas, "fora": fora}
+        self.destroy()
+
+
 class TelaCopias(tk.Toplevel):
     """Todas as copias e versoes de um documento que apareceu uma vez so na busca."""
 
@@ -826,7 +996,7 @@ class MenuEmpresas(tk.Frame):
 
     def _pintar(self, chave, b):
         if chave == self.selecionado:
-            b.config(bg="white", fg=AZUL, font=FONTE_MENU_SEL, relief="sunken")
+            b.config(bg="white", fg=DESTAQUE, font=FONTE_MENU_SEL, relief="sunken")
         else:
             b.config(bg=BOTAO_COR, fg="white", font=FONTE_MENU, relief="raised")
 
@@ -866,7 +1036,7 @@ class App:
         self.temp_dir = tempfile.mkdtemp(prefix="buscadatabook_")
         self.ordem = {}
 
-        root.title(f"{APP_NOME} {VERSAO}  —  {usuario['login']}")
+        self._titulo()
         root.geometry(self.cfg.get("geometria", "1280x720"))
         root.minsize(980, 520)
         root.protocol("WM_DELETE_WINDOW", self.sair)
@@ -878,6 +1048,10 @@ class App:
         self._carregar_pasta_inicial()
         self.root.after(100, self._processar_fila)
         self.root.after(3000, self._verificacao_automatica)
+
+    def _titulo(self):
+        cliente = f" — {MARCA['cliente']}" if MARCA else ""
+        self.root.title(f"{APP_NOME}{cliente}  ·  {VERSAO}  ·  {self.usuario['login']}")
 
     def _erro_tk(self, tipo, valor, tb):
         log.error("Erro na interface", exc_info=(tipo, valor, tb))
@@ -892,7 +1066,7 @@ class App:
             st.theme_use("vista")
         st.configure("Treeview", rowheight=24)
         st.configure("Titulo.TLabel", font=("Segoe UI", 10, "bold"))
-        st.configure("Escopo.TLabel", font=("Segoe UI", 10, "bold"), foreground=AZUL)
+        st.configure("Escopo.TLabel", font=("Segoe UI", 10, "bold"), foreground=DESTAQUE)
 
     def _menu(self):
         m = tk.Menu(self.root)
@@ -905,6 +1079,11 @@ class App:
         arq.add_separator()
         arq.add_command(label="Exportar índice...", command=self.exportar_indice)
         arq.add_command(label="Importar índice...", command=self.importar_indice)
+        arq.add_separator()
+        arq.add_command(label="Importar pacote do cliente...", command=lambda: self.importar_pacote())
+        if self.usuario["admin"]:
+            arq.add_command(label="Criar pacote do cliente...", command=self.criar_pacote)
+            arq.add_command(label="Remover personalização do cliente", command=self.remover_personalizacao)
         arq.add_separator()
         arq.add_command(label="Sair", command=self.sair)
         m.add_cascade(label="Arquivo", menu=arq)
@@ -949,39 +1128,46 @@ class App:
         self.menu_emp.pack(side="left", fill="y")
         principal = ttk.Frame(self.root)
         principal.pack(side="left", fill="both", expand=True)
+        self.principal = principal
 
         topo = ttk.Frame(principal, padding=(10, 10, 10, 4))
         topo.pack(fill="x")
         topo.columnconfigure(1, weight=1)
 
-        ttk.Label(topo, text="Pasta principal:", style="Titulo.TLabel").grid(row=0, column=0, sticky="w")
+        # logomarca do cliente: canto superior direito, acima de "Atualizar indice"
+        self.lbl_marca = ttk.Label(topo)
+        self.lbl_marca.grid(row=0, column=2, columnspan=3, sticky="e", pady=(0, 6))
+        self._img_marca = None
+        self._mostrar_logo_cliente()
+
+        ttk.Label(topo, text="Pasta principal:", style="Titulo.TLabel").grid(row=1, column=0, sticky="w")
         self.var_pasta = tk.StringVar()
         self.cb_pasta = ttk.Combobox(topo, textvariable=self.var_pasta, values=self.cfg.get("recentes", []))
-        self.cb_pasta.grid(row=0, column=1, sticky="ew", padx=6)
+        self.cb_pasta.grid(row=1, column=1, sticky="ew", padx=6)
         self.cb_pasta.bind("<<ComboboxSelected>>", lambda e: self._pasta_mudou())
         self.cb_pasta.bind("<Return>", lambda e: self._pasta_mudou())
-        ttk.Button(topo, text="Procurar...", command=self.escolher_pasta).grid(row=0, column=2, padx=2)
+        ttk.Button(topo, text="Procurar...", command=self.escolher_pasta).grid(row=1, column=2, padx=2)
         self.bt_indice = ttk.Button(topo, text="Atualizar índice", command=self.atualizar_indice)
-        self.bt_indice.grid(row=0, column=3, columnspan=2, sticky="ew", padx=2)
+        self.bt_indice.grid(row=1, column=3, columnspan=2, sticky="ew", padx=2)
 
         self.lbl_info = ttk.Label(topo, text="", foreground="#555")
-        self.lbl_info.grid(row=1, column=1, sticky="w", padx=6, pady=(2, 8))
+        self.lbl_info.grid(row=2, column=1, sticky="w", padx=6, pady=(2, 8))
 
-        ttk.Label(topo, text="Buscar:", style="Titulo.TLabel").grid(row=2, column=0, sticky="w")
+        ttk.Label(topo, text="Buscar:", style="Titulo.TLabel").grid(row=3, column=0, sticky="w")
         self.var_termo = tk.StringVar()
         self.e_termo = ttk.Entry(topo, textvariable=self.var_termo, font=("Segoe UI", 11))
-        self.e_termo.grid(row=2, column=1, sticky="ew", padx=6)
+        self.e_termo.grid(row=3, column=1, sticky="ew", padx=6)
         self.e_termo.bind("<Return>", lambda e: self.buscar())
         self.root.bind("<Escape>", lambda e: self.limpar_busca())
-        ttk.Button(topo, text="Buscar", command=self.buscar).grid(row=2, column=2, padx=2)
-        ttk.Button(topo, text="Limpar", command=self.limpar_busca).grid(row=2, column=3, padx=2)
+        ttk.Button(topo, text="Buscar", command=self.buscar).grid(row=3, column=2, padx=2)
+        ttk.Button(topo, text="Limpar", command=self.limpar_busca).grid(row=3, column=3, padx=2)
         self.var_filtro = tk.StringVar(value="Todos os tipos")
         cb = ttk.Combobox(topo, textvariable=self.var_filtro, values=list(FILTROS), state="readonly", width=18)
-        cb.grid(row=2, column=4, padx=2)
+        cb.grid(row=3, column=4, padx=2)
         cb.bind("<<ComboboxSelected>>", lambda e: self._mostrar_resultados())
 
         linha3 = ttk.Frame(topo)
-        linha3.grid(row=3, column=1, sticky="w", padx=6, pady=(6, 0))
+        linha3.grid(row=4, column=1, sticky="w", padx=6, pady=(6, 0))
         ttk.Label(linha3, text="Procurar no:").pack(side="left")
         self.var_modo = tk.StringVar(value=self.cfg.get("modo_busca", "tudo"))
         ttk.Radiobutton(linha3, text="Nome e conteúdo", value="tudo", variable=self.var_modo,
@@ -992,7 +1178,7 @@ class App:
         self.lbl_escopo.pack(side="left", padx=(18, 0))
         self.var_ocultar = tk.BooleanVar(value=self.cfg.get("ocultar_repetidos", True))
         ttk.Checkbutton(topo, text="Ocultar cópias e versões antigas", variable=self.var_ocultar,
-                        command=self._ocultar_mudou).grid(row=3, column=2, columnspan=3, sticky="e", pady=(6, 0))
+                        command=self._ocultar_mudou).grid(row=4, column=2, columnspan=3, sticky="e", pady=(6, 0))
 
         # resultados
         meio = ttk.Frame(principal, padding=(10, 4))
@@ -1219,7 +1405,7 @@ class App:
                     self._fim_indexacao(msg[1])
                 elif tipo == "erro":
                     self._fim_indexacao(None, msg[1])
-                elif tipo.startswith("exp_") or tipo.startswith("imp_"):
+                elif tipo.startswith(("exp_", "imp_", "pac_", "pim_")):
                     self._fim_exportar_importar(msg)
                 elif tipo.startswith("upd_"):
                     self._tratar_atualizacao(msg)
@@ -1376,9 +1562,163 @@ class App:
 
         threading.Thread(target=tarefa, daemon=True).start()
 
+    # ---- personalizacao do cliente (pacote .bdpack) -------------------------
+
+    def _mostrar_logo_cliente(self):
+        self._img_marca = None
+        logo = (MARCA or {}).get("logo")
+        if logo:
+            try:
+                from PIL import Image, ImageTk
+                img = Image.open(logo)
+                img.thumbnail((260, 56), getattr(Image, "Resampling", Image).LANCZOS)
+                self._img_marca = ImageTk.PhotoImage(img)
+            except Exception:
+                log.warning("Logomarca do cliente não carregada", exc_info=True)
+        if self._img_marca:
+            self.lbl_marca.config(image=self._img_marca, text="")
+            self.lbl_marca.grid()
+        else:
+            self.lbl_marca.config(image="", text="")
+            self.lbl_marca.grid_remove()
+
+    def _reaplicar_tema(self):
+        """Aplica na hora a personalizacao instalada (cores, titulo, logomarca)."""
+        aplicar_tema(core.carregar_marca())
+        self._titulo()
+        ttk.Style().configure("Escopo.TLabel", foreground=DESTAQUE)
+        self.menu_emp.destroy()
+        self.menu_emp = MenuEmpresas(self.root, self._empresa_escolhida)
+        self.menu_emp.pack(side="left", fill="y", before=self.principal)
+        self._carregar_empresas(manter=True)
+        self._mostrar_logo_cliente()
+
+    def criar_pacote(self):
+        if self.trabalhando:
+            messagebox.showinfo(APP_NOME, "Aguarde o fim da tarefa em andamento (ou cancele).")
+            return
+        tem_indice = bool(self.indice_busca and self.indice_busca.info()[0] > 0)
+        empresas = self.indice_busca.empresas() if tem_indice else []
+        tela = TelaPacote(self.root, empresas, tem_indice, self.cfg.get("ultimo_pacote", {}))
+        self.root.wait_window(tela)
+        r = tela.resultado
+        if not r:
+            return
+        self.cfg["ultimo_pacote"] = {"cliente": r["cliente"], "cor": r["cor"] or "", "logo": r["logo"] or ""}
+        self._salvar_cfg()
+        nome = "".join(c if c.isalnum() or c in " -_" else "_" for c in r["cliente"]).strip() or "Cliente"
+        destino = filedialog.asksaveasfilename(
+            title="Salvar pacote do cliente", defaultextension=core.EXT_PACOTE,
+            initialfile=f"BuscaDatabook_{nome}_{time.strftime('%Y-%m-%d')}{core.EXT_PACOTE}",
+            filetypes=[("Pacote do Busca Databook", f"*{core.EXT_PACOTE}")])
+        if not destino:
+            return
+        raiz = self.indice_busca.raiz if (r["incluir_indice"] and self.indice_busca) else None
+        self._iniciar_tarefa("exportar", cancelavel=False)
+        self.lbl_status.config(text="Criando o pacote do cliente...")
+
+        def tarefa():
+            idx = core.Indice(raiz) if raiz else None
+            try:
+                logo = open(r["logo"], "rb").read() if r["logo"] else None
+                m = core.criar_pacote(destino, r["cliente"], r["cor"], logo, idx, r["pastas"], r["fora"])
+                self.fila.put(("pac_fim", m, destino))
+            except Exception as e:
+                log.exception("Erro ao criar pacote")
+                self.fila.put(("pac_erro", str(e)))
+            finally:
+                if idx:
+                    idx.fechar()
+
+        threading.Thread(target=tarefa, daemon=True).start()
+
+    def importar_pacote(self, arquivo=None):
+        if self.trabalhando:
+            messagebox.showinfo(APP_NOME, "Aguarde o fim da tarefa em andamento (ou cancele).")
+            return
+        if not arquivo:
+            arquivo = filedialog.askopenfilename(
+                title="Importar pacote do cliente",
+                filetypes=[("Pacote do Busca Databook", f"*{core.EXT_PACOTE}"), ("Todos os arquivos", "*.*")])
+            if not arquivo:
+                return
+        try:
+            info = core.ler_pacote(arquivo)
+        except ValueError as e:
+            messagebox.showerror(APP_NOME, str(e))
+            return
+        resumo = f"Pacote: {info['cliente']}" + (f" (criado em {info['criado_em']})" if info["criado_em"] else "")
+        if info["tem_indice"] and info["indice"]:
+            resumo += f"\nÍndice com {info['indice'].get('arquivos', 0):,} arquivos".replace(",", ".")
+        nova = None
+        if info["tem_indice"]:
+            origem = info["pasta_origem"]
+            if origem and os.path.isdir(origem):
+                resp = messagebox.askyesnocancel(
+                    APP_NOME, resumo + f"\n\nPasta dos databooks:\n{origem}\n\nEssa pasta existe neste computador."
+                                       "\n\nSim: usar essa pasta\nNão: escolher outra pasta")
+                if resp is None:
+                    return
+                nova = origem if resp else filedialog.askdirectory(title="Onde está a pasta dos databooks neste computador?")
+            else:
+                messagebox.showinfo(APP_NOME, resumo + "\n\nNa próxima tela, escolha onde estão os databooks "
+                                                       "neste computador.")
+                nova = filedialog.askdirectory(title="Onde está a pasta dos databooks neste computador?")
+            if not nova:
+                return
+            nova = os.path.normpath(nova)
+        elif not messagebox.askyesno(APP_NOME, resumo + "\n\nAplicar a personalização deste cliente?"):
+            return
+        self._iniciar_tarefa("importar", cancelavel=False)
+        self.lbl_status.config(text="Aplicando o pacote do cliente...")
+
+        def tarefa():
+            try:
+                info2, n = core.importar_pacote(arquivo, nova)
+                self.fila.put(("pim_fim", info2, n, nova))
+            except Exception as e:
+                log.exception("Erro ao importar pacote")
+                self.fila.put(("pim_erro", str(e)))
+
+        threading.Thread(target=tarefa, daemon=True).start()
+
+    def remover_personalizacao(self):
+        if not MARCA:
+            messagebox.showinfo(APP_NOME, "Nenhuma personalização de cliente instalada.")
+            return
+        if messagebox.askyesno(APP_NOME, f"Remover a personalização de “{MARCA['cliente']}” "
+                                         "(nome, cores e logomarca)?\n\nO índice e as buscas não são afetados."):
+            core.remover_marca()
+            log.info("Personalização do cliente removida")
+            self._reaplicar_tema()
+
     def _fim_exportar_importar(self, msg):
         self._terminar_tarefa()
         tipo = msg[0]
+        if tipo == "pac_fim":
+            _, m, destino = msg
+            self.lbl_status.config(text="Pacote do cliente criado.")
+            det = (f"Índice: {m['indice']['arquivos']:,} arquivos".replace(",", ".") if m["indice"]
+                   else "Sem índice (só a identidade visual).")
+            messagebox.showinfo(APP_NOME, f"Pacote de “{m['cliente']}” criado:\n{destino}\n\n{det}\n\n"
+                                          "No computador do cliente: instale o programa e use Arquivo > "
+                                          "Importar pacote do cliente (ou dê dois cliques no arquivo).")
+            return
+        if tipo == "pim_fim":
+            _, info, n, nova = msg
+            self._reaplicar_tema()
+            if nova:
+                self.var_pasta.set(nova)
+                self._pasta_mudou(silencioso=True)
+            self.lbl_status.config(text=f"Pacote de {info['cliente']} aplicado.")
+            messagebox.showinfo(APP_NOME, f"Pacote de “{info['cliente']}” aplicado."
+                                + (f"\n\n{n:,} arquivos importados para:\n{nova}".replace(",", ".") if nova else ""))
+            return
+        if tipo in ("pac_erro", "pim_erro"):
+            acao = "criar" if tipo == "pac_erro" else "aplicar"
+            self.lbl_status.config(text=f"Não foi possível {acao} o pacote.")
+            messagebox.showerror(APP_NOME, f"Não foi possível {acao} o pacote do cliente:\n{msg[1]}")
+            return
         if tipo == "exp_fim":
             _, n, destino = msg
             self.lbl_status.config(text=f"Índice exportado: {n} arquivos.")
@@ -1740,6 +2080,7 @@ def main():
             pass
     root = tk.Tk()
     root.withdraw()
+    aplicar_tema(core.carregar_marca())
     aplicar_icone(root)
     # sem console no .exe: erros de callback vao para o erro.log (a App substitui depois)
     root.report_callback_exception = lambda t, v, tb: log.error("Erro na interface", exc_info=(t, v, tb))
@@ -1751,7 +2092,10 @@ def main():
             root.destroy()
             return
         root.deiconify()
-        App(root, login.resultado, usuarios)
+        app = App(root, login.resultado, usuarios)
+        pacote = next((a for a in sys.argv[1:] if a.lower().endswith(core.EXT_PACOTE)), None)
+        if pacote and os.path.isfile(pacote):          # duplo clique no .bdpack
+            root.after(800, lambda: app.importar_pacote(pacote))
         root.mainloop()
     except Exception as e:
         log.critical("Falha fatal", exc_info=True)

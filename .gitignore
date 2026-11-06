@@ -8,3 +8,6 @@ vendor/
 .venv/
 assets/icone.ico
 assets/icone_preview.png
+# dados de clientes: nunca publicar (repositorio publico)
+*.bdpack
+*.bdx

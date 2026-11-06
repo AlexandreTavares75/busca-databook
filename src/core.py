@@ -10,6 +10,7 @@ import hashlib
 import hmac
 import html
 import io
+import json
 import logging
 import os
 import re
@@ -51,6 +52,8 @@ SENHA_MIN = 6                 # vale para senhas novas; senhas antigas continuam
 
 FORMATO_EXPORTACAO = "buscadatabook-indice/1"
 EXT_EXPORTACAO = ".bdx"
+FORMATO_PACOTE = "buscadatabook-pacote/1"
+EXT_PACOTE = ".bdpack"
 
 # Atributos de arquivo do Windows usados pelo OneDrive (Arquivos sob demanda)
 _ATR_OFFLINE = 0x1000
@@ -1011,6 +1014,189 @@ def importar_indice(arquivo, nova_raiz):
             tmp.unlink()
         except OSError:
             pass
+
+
+# --------------------------------------------------------------------------
+# Pacote do cliente (.bdpack): identidade visual + pasta principal + indice
+# --------------------------------------------------------------------------
+#
+# Um .bdpack e um zip com no maximo 3 itens:
+#   manifest.json  - nome do cliente, cor do menu, pasta de origem, resumo do indice
+#   logo.png       - logomarca do cliente (opcional)
+#   indice.bdx     - indice exportado (opcional)
+# Nada e extraido para caminhos vindos do arquivo: so esses nomes fixos sao lidos.
+
+RE_COR = re.compile(r"^#[0-9A-Fa-f]{6}$")
+MAX_LOGO_BYTES = 5 * 1024 * 1024
+MAX_MANIFEST_BYTES = 64 * 1024
+
+
+def pasta_marca() -> Path:
+    p = pasta_dados_app() / "marca"
+    p.mkdir(exist_ok=True)
+    return p
+
+
+def preparar_logo(dados: bytes) -> bytes:
+    """Valida e re-grava a logomarca como PNG limpo (corta bordas transparentes, max. 600x200)."""
+    if len(dados) > MAX_LOGO_BYTES:
+        raise ValueError("A logomarca é grande demais (máximo 5 MB).")
+    from PIL import Image
+    try:
+        with Image.open(io.BytesIO(dados)) as teste:
+            teste.verify()
+        img = Image.open(io.BytesIO(dados)).convert("RGBA")
+    except Exception:
+        raise ValueError("O arquivo da logomarca não é uma imagem válida.")
+    caixa = img.getchannel("A").getbbox()
+    if caixa:
+        img = img.crop(caixa)
+    img.thumbnail((600, 200), getattr(Image, "Resampling", Image).LANCZOS)
+    saida = io.BytesIO()
+    img.save(saida, "PNG")
+    return saida.getvalue()
+
+
+def _validar_manifest(m):
+    if not isinstance(m, dict) or m.get("formato") != FORMATO_PACOTE:
+        raise ValueError("Este arquivo não é um pacote do Busca Databook.")
+    cliente = str(m.get("cliente") or "").strip()
+    if not cliente or len(cliente) > 80:
+        raise ValueError("Pacote sem nome de cliente válido.")
+    cor = m.get("cor_menu")
+    if cor is not None and not RE_COR.match(str(cor)):
+        raise ValueError("Cor do menu inválida no pacote.")
+    return {"cliente": cliente, "cor_menu": cor, "pasta_origem": str(m.get("pasta_origem") or ""),
+            "indice": m.get("indice") if isinstance(m.get("indice"), dict) else None,
+            "criado_em": str(m.get("criado_em") or "")}
+
+
+def criar_pacote(destino, cliente, cor_menu=None, logo_bytes=None, indice=None, pastas=None, incluir_fora=True):
+    """
+    Gera o .bdpack. indice: um Indice aberto (ou None para pacote so com a identidade visual);
+    pastas/incluir_fora: quais empresas exportar (mesma regra de Indice.exportar).
+    """
+    cliente = (cliente or "").strip()
+    if not cliente:
+        raise ValueError("Informe o nome do cliente.")
+    if cor_menu and not RE_COR.match(cor_menu):
+        raise ValueError("Cor inválida: use o formato #RRGGBB (ex.: #FA7C13).")
+    logo = preparar_logo(logo_bytes) if logo_bytes else None
+    manifest = {"formato": FORMATO_PACOTE, "cliente": cliente, "cor_menu": cor_menu or None,
+                "criado_em": time.strftime("%d/%m/%Y %H:%M"), "pasta_origem": "", "indice": None}
+    destino = Path(destino)
+    tmp_bdx = None
+    try:
+        if indice is not None:
+            (pasta_dados_app() / "indices").mkdir(exist_ok=True)
+            tmp_bdx = pasta_dados_app() / "indices" / f"pacote-{os.getpid()}-{int(time.time())}.bdx"
+            n = indice.exportar(tmp_bdx, pastas, incluir_fora)
+            manifest["pasta_origem"] = indice.raiz
+            manifest["indice"] = {"arquivos": n, "atualizado": (indice.info()[1] or "")}
+        parcial = destino.with_name(destino.name + ".tmp")
+        with zipfile.ZipFile(parcial, "w", zipfile.ZIP_DEFLATED) as z:
+            z.writestr("manifest.json", json.dumps(manifest, ensure_ascii=False, indent=2))
+            if logo:
+                z.writestr("logo.png", logo)
+            if tmp_bdx:
+                z.write(tmp_bdx, "indice.bdx")
+        os.replace(parcial, destino)
+    finally:
+        if tmp_bdx and tmp_bdx.exists():
+            tmp_bdx.unlink()
+    log.info("Pacote do cliente criado: %s (%s)", destino, cliente)
+    return manifest
+
+
+def ler_pacote(arquivo):
+    """Le e valida o pacote sem extrair o indice. Devolve o manifest validado + tem_logo/tem_indice."""
+    try:
+        z = zipfile.ZipFile(arquivo)
+    except (zipfile.BadZipFile, OSError) as e:
+        raise ValueError(f"Não foi possível abrir o pacote: {e}")
+    with z:
+        nomes = {i.filename: i for i in z.infolist()}
+        if set(nomes) - {"manifest.json", "logo.png", "indice.bdx"} or "manifest.json" not in nomes:
+            raise ValueError("Pacote com conteúdo inesperado. Por segurança, ele não será usado.")
+        if nomes["manifest.json"].file_size > MAX_MANIFEST_BYTES:
+            raise ValueError("Pacote inválido (manifesto grande demais).")
+        if "logo.png" in nomes and nomes["logo.png"].file_size > MAX_LOGO_BYTES:
+            raise ValueError("Pacote inválido (logomarca grande demais).")
+        try:
+            m = json.loads(z.read("manifest.json").decode("utf-8"))
+        except Exception:
+            raise ValueError("Pacote inválido (manifesto ilegível).")
+        info = _validar_manifest(m)
+        info["tem_logo"] = "logo.png" in nomes
+        info["tem_indice"] = "indice.bdx" in nomes
+        return info
+
+
+def aplicar_marca(cliente, cor_menu=None, logo_png=None):
+    """Grava a identidade visual deste computador (vale para todos os usuarios do app neste Windows)."""
+    d = pasta_marca()
+    logo_arq = d / "logo.png"
+    if logo_png:
+        tmp = d / "logo.tmp"
+        tmp.write_bytes(preparar_logo(logo_png))
+        os.replace(tmp, logo_arq)
+    elif logo_arq.exists():
+        logo_arq.unlink()
+    tmp = d / "marca.tmp"
+    tmp.write_text(json.dumps({"cliente": cliente, "cor_menu": cor_menu}, ensure_ascii=False), encoding="utf-8")
+    os.replace(tmp, d / "marca.json")
+
+
+def carregar_marca():
+    """{"cliente", "cor_menu", "logo"} da personalizacao instalada, ou None."""
+    d = pasta_dados_app() / "marca"
+    try:
+        m = json.loads((d / "marca.json").read_text(encoding="utf-8"))
+        cliente = str(m.get("cliente") or "").strip()[:80]
+        cor = m.get("cor_menu") if m.get("cor_menu") and RE_COR.match(str(m.get("cor_menu"))) else None
+        if not cliente:
+            return None
+        logo = d / "logo.png"
+        return {"cliente": cliente, "cor_menu": cor, "logo": str(logo) if logo.is_file() else None}
+    except Exception:
+        return None
+
+
+def remover_marca():
+    d = pasta_dados_app() / "marca"
+    for n in ("marca.json", "logo.png"):
+        try:
+            (d / n).unlink()
+        except OSError:
+            pass
+
+
+def importar_pacote(arquivo, nova_raiz=None):
+    """
+    Aplica o pacote: identidade visual e, se houver indice, importa-o para nova_raiz.
+    Devolve (info do pacote, arquivos importados).
+    """
+    info = ler_pacote(arquivo)
+    n = 0
+    tmp = None
+    with zipfile.ZipFile(arquivo) as z:
+        logo = z.read("logo.png") if info["tem_logo"] else None
+        if info["tem_indice"]:
+            if not nova_raiz:
+                raise ValueError("Escolha a pasta principal para importar o índice.")
+            (pasta_dados_app() / "indices").mkdir(exist_ok=True)      # PC recem-instalado
+            tmp = pasta_dados_app() / "indices" / f"pacote-imp-{os.getpid()}-{int(time.time())}.bdx"
+            with z.open("indice.bdx") as src, open(tmp, "wb") as dst:
+                shutil.copyfileobj(src, dst, 1 << 20)
+    try:
+        aplicar_marca(info["cliente"], info["cor_menu"], logo)
+        if tmp:
+            n = importar_indice(tmp, nova_raiz)
+    finally:
+        if tmp and tmp.exists():
+            tmp.unlink()
+    log.info("Pacote do cliente aplicado: %s (%d arquivos)", info["cliente"], n)
+    return info, n
 
 
 # --------------------------------------------------------------------------

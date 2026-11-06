@@ -43,6 +43,7 @@ UninstallDisplayIcon={app}\{#AppExe}
 UninstallDisplayName={#AppName}
 SetupLogging=yes
 CloseApplications=yes
+ChangesAssociations=yes
 RestartApplications=no
 
 [Languages]
@@ -64,6 +65,13 @@ Source: "..\LEIA-ME.txt"; DestDir: "{app}"; Flags: ignoreversion
 [Icons]
 Name: "{autoprograms}\{#AppName}"; Filename: "{app}\{#AppExe}"
 Name: "{autodesktop}\{#AppName}"; Filename: "{app}\{#AppExe}"; Tasks: desktopicon
+
+[Registry]
+; Duplo clique num pacote do cliente (.bdpack) abre o programa e importa o pacote (so para este usuario)
+Root: HKA; Subkey: "Software\Classes\.bdpack"; ValueType: string; ValueName: ""; ValueData: "BuscaDatabook.Pacote"; Flags: uninsdeletevalue
+Root: HKA; Subkey: "Software\Classes\BuscaDatabook.Pacote"; ValueType: string; ValueName: ""; ValueData: "Pacote do Busca Databook"; Flags: uninsdeletekey
+Root: HKA; Subkey: "Software\Classes\BuscaDatabook.Pacote\DefaultIcon"; ValueType: string; ValueName: ""; ValueData: "{app}\{#AppExe},0"
+Root: HKA; Subkey: "Software\Classes\BuscaDatabook.Pacote\shell\open\command"; ValueType: string; ValueName: ""; ValueData: """{app}\{#AppExe}"" ""%1"""
 
 [Run]
 ; Instalacao normal: oferece abrir o programa no final

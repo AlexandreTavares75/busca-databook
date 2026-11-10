@@ -1508,7 +1508,10 @@ class App:
             txt += (f". ⚠ {r['falhas']} pasta(s)/arquivo(s) inacessíveis (rede/VPN?): "
                     "por segurança nada foi removido do índice")
         if r["cancelado"]:
-            txt = "Indexação cancelada. " + txt
+            faltam = max(0, r.get("a_ler", r["lidos"]) - r["lidos"])
+            txt = ("Indexação cancelada. " + txt
+                   + (f". Os já lidos ficaram salvos; faltam {faltam}, que serão lidos na próxima atualização"
+                      if faltam else ""))
         self.lbl_status.config(text=txt + ".")
         if self.var_termo.get().strip() and (not automatico or r["lidos"] or r["removidos"]):
             self.buscar()

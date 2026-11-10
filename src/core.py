@@ -715,7 +715,7 @@ class Indice:
             self._remover(p)
         self.con.commit()
 
-        erros = liberados = 0
+        erros = liberados = lidos = 0
         total = len(novos)
         t_commit = time.time()
         for i, p in enumerate(novos, 1):
@@ -749,6 +749,7 @@ class Indice:
                     (p, interno, nome_busca, texto))
             self.con.execute("INSERT OR REPLACE INTO arquivos VALUES (?,?,?,?)",
                              (p, mtime, tam, status))
+            lidos += 1
             if time.time() - t_commit > 5:
                 self.con.commit()
                 t_commit = time.time()
@@ -756,7 +757,8 @@ class Indice:
         self.con.execute("INSERT OR REPLACE INTO meta VALUES ('atualizado', ?)",
                          (time.strftime("%d/%m/%Y %H:%M"),))
         self.con.commit()
-        return {"total": len(no_disco), "lidos": total, "removidos": len(removidos),
+        # lidos = efetivamente lidos (num cancelamento, menos que a_ler); o que ja foi lido fica salvo
+        return {"total": len(no_disco), "lidos": lidos, "a_ler": total, "removidos": len(removidos),
                 "erros": erros, "liberados": liberados, "falhas": falhas, "cancelado": cancelado()}
 
     def contem(self, caminho) -> bool:

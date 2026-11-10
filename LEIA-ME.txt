@@ -16,6 +16,9 @@ NOVIDADES DA 3.4
 - Resultados com rolagem para os lados: a coluna Pasta se alarga até
   caber o endereço inteiro; use a barra de baixo ou Shift + roda do
   mouse. Também vale na janela "Cópias e versões".
+- 3.4.1: ao cancelar a indexação, a mensagem mostra quantos arquivos foram
+  realmente lidos (antes mostrava o total previsto). O que já foi lido
+  fica salvo e a próxima atualização continua de onde parou.
 
 
 NOVIDADES DA 3.3

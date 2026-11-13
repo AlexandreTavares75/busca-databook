@@ -1,0 +1,17 @@
+__pycache__/
+*.pyc
+build/
+dist/
+output/
+vendor/
+*.spec
+.venv/
+assets/icone.ico
+assets/icone_preview.png
+# dados de clientes: nunca publicar (repositorio publico)
+*.bdpack
+*.bdx
+# chave privada de assinatura: nunca publicar
+*.pem
+*.key
+chave_privada*

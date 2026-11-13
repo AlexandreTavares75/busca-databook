@@ -5,4 +5,5 @@ python-pptx
 pypdfium2
 pytesseract
 Pillow
+cryptography
 pywin32; sys_platform == "win32"

@@ -1,0 +1,477 @@
+From eb2f7dbd7fe06d2437181254d7340bfcd278780e Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Fri, 13 Nov 2026 13:02:15 -0300
+Subject: [PATCH] =?UTF-8?q?Vers=C3=A3o=203.5.0:=20atualiza=C3=A7=C3=B5es?=
+ =?UTF-8?q?=20assinadas=20(Ed25519)?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+- updater exige .sha256.sig e confere a assinatura com a chave pública embutida
+- a assinatura amarra o hash ao nome do instalador (impede reaproveitar de outra versão)
+- tools/assinar_release.py: gerar chave, assinar e verificar
+- workflow cria a release como rascunho e falha se a chave pública estiver vazia
+- .gitignore bloqueia chaves privadas
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_017fGvNn1vABnDxgPmfSgW2Z
+---
+ .github/workflows/release.yml |  19 +++-
+ .gitignore                    |   4 +
+ LEIA-ME.txt                   |  15 ++-
+ requirements.txt              |   1 +
+ src/updater.py                |  74 +++++++++++++--
+ src/versao.py                 |  11 ++-
+ tools/assinar_release.py      | 172 ++++++++++++++++++++++++++++++++++
+ 7 files changed, 279 insertions(+), 17 deletions(-)
+ create mode 100644 tools/assinar_release.py
+
+diff --git a/.github/workflows/release.yml b/.github/workflows/release.yml
+index d6c7de4..7c7a00c 100644
+--- a/.github/workflows/release.yml
++++ b/.github/workflows/release.yml
+@@ -1,7 +1,12 @@
+ name: Build e Release
+ 
+-# Gera o instalador a cada tag vX.Y.Z e publica na aba Releases.
+-# "Run workflow" manual gera o instalador como artefato, sem publicar.
++# Gera o instalador a cada tag vX.Y.Z e cria a release como RASCUNHO (draft).
++# O rascunho nao aparece para os programas instalados. Para liberar:
++#   1. baixe o .sha256 do rascunho;
++#   2. assine no seu computador: python tools/assinar_release.py assinar <arquivo.sha256>
++#   3. anexe o .sig gerado ao rascunho e clique em "Publish release".
++# Sem o .sig valido, os programas instalados (3.5.0+) recusam a atualizacao.
++# "Run workflow" manual gera o instalador como artefato, sem criar release.
+ on:
+   push:
+     tags: ["v*.*.*"]
+@@ -50,6 +55,13 @@ jobs:
+           }
+           Add-Content -Path $env:GITHUB_OUTPUT -Value "versao=$v"
+ 
++      - name: Conferir chave pública de atualização
++        run: |
++          $k = python -c "import sys; sys.path.insert(0, 'src'); import versao; print(versao.CHAVE_PUBLICA_ATUALIZACAO)"
++          if ($k.Trim().Length -ne 44) {
++            throw "CHAVE_PUBLICA_ATUALIZACAO vazia ou inválida em src/versao.py. Gere com: python tools/assinar_release.py gerar-chave"
++          }
++
+       - name: Instalar dependências
+         run: |
+           python -m pip install --upgrade pip
+@@ -115,7 +127,7 @@ jobs:
+           path: output/
+           if-no-files-found: error
+ 
+-      - name: Publicar release
++      - name: Criar release (rascunho)
+         if: github.event_name == 'push' && github.ref_type == 'tag'
+         env:
+           GH_TOKEN: ${{ github.token }}
+@@ -124,6 +136,7 @@ jobs:
+         run: |
+           $exe = "output\BuscaDatabook-Setup-$env:VERSAO.exe"
+           gh release create $env:TAG $exe "$exe.sha256" `
++            --draft `
+             --repo $env:GITHUB_REPOSITORY `
+             --title "Busca Databook $env:VERSAO" `
+             --generate-notes
+diff --git a/.gitignore b/.gitignore
+index 1c02349..b2aa778 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -11,3 +11,7 @@ assets/icone_preview.png
+ # dados de clientes: nunca publicar (repositorio publico)
+ *.bdpack
+ *.bdx
++# chave privada de assinatura: nunca publicar
++*.pem
++*.key
++chave_privada*
+diff --git a/LEIA-ME.txt b/LEIA-ME.txt
+index 4594da8..110c7f3 100644
+--- a/LEIA-ME.txt
++++ b/LEIA-ME.txt
+@@ -1,4 +1,4 @@
+-BUSCA DATABOOK 3.4
++BUSCA DATABOOK 3.5
+ ==================
+ 
+ Programa para Windows que procura uma palavra (ex.: "Trafo") dentro dos
+@@ -7,6 +7,14 @@ documentos de uma pasta e de todas as suas subpastas: no PC, na rede
+ (OneDrive, Google Drive para computador, SharePoint sincronizado).
+ 
+ 
++NOVIDADES DA 3.5
++----------------
++- Atualizações assinadas: além de conferir o SHA-256, o programa só instala
++  uma versão nova se ela tiver a assinatura digital do desenvolvedor. Nem
++  quem invadisse a conta do GitHub conseguiria publicar uma atualização
++  aceita. Não muda nada no uso do dia a dia.
++
++
+ NOVIDADES DA 3.4
+ ----------------
+ - Senhas mais fortes (obrigatório): mínimo de 8 caracteres, com letra
+@@ -107,8 +115,9 @@ ATUALIZAÇÕES
+ Ao abrir (no máximo uma vez por dia) o programa consulta o GitHub.
+ Também dá para verificar em Ajuda > Verificar atualizações, e desligar a
+ verificação automática no mesmo menu.
+-Segurança: só baixa de endereços do GitHub via HTTPS e só instala se o
+-SHA-256 do arquivo baixado for igual ao publicado na release.
++Segurança: só baixa de endereços do GitHub via HTTPS, confere a assinatura
++digital do desenvolvedor (versão 3.5 em diante) e só instala se o SHA-256
++do arquivo baixado for igual ao assinado.
+ 
+ 
+ ONDE FICAM OS DADOS
+diff --git a/requirements.txt b/requirements.txt
+index c821daf..931ef0f 100644
+--- a/requirements.txt
++++ b/requirements.txt
+@@ -5,4 +5,5 @@ python-pptx
+ pypdfium2
+ pytesseract
+ Pillow
++cryptography
+ pywin32; sys_platform == "win32"
+\ No newline at end of file
+diff --git a/src/updater.py b/src/updater.py
+index 9dd7f09..27655c7 100644
+--- a/src/updater.py
++++ b/src/updater.py
+@@ -7,13 +7,19 @@ Fluxo:
+      "BuscaDatabook-Setup-X.Y.Z.exe" e o arquivo "...exe.sha256";
+   3. baixa o instalador para %LOCALAPPDATA%\\BuscaDatabook\\atualizacoes,
+      calculando o SHA-256 durante o download;
+-  4. so instala se o hash bater com o .sha256 publicado (e com o digest que o
++  4. confere a ASSINATURA do .sha256 (arquivo "...exe.sha256.sig") com a chave
++     publica embutida no programa (versao.CHAVE_PUBLICA_ATUALIZACAO). A chave
++     privada fica so no computador do desenvolvedor, fora do GitHub: mesmo quem
++     invadir a conta ou o repositorio nao consegue publicar uma atualizacao aceita;
++  5. so instala se o hash bater com o .sha256 assinado (e com o digest que o
+      proprio GitHub calcula no upload, quando disponivel);
+-  5. confere o hash de novo imediatamente antes de executar.
++  6. confere o hash de novo imediatamente antes de executar.
+ 
+ Somente HTTPS e somente hosts do GitHub, inclusive nos redirecionamentos.
+ """
+ 
++import base64
++import binascii
+ import hashlib
+ import json
+ import logging
+@@ -27,7 +33,7 @@ from pathlib import Path
+ from urllib.parse import urlparse
+ 
+ import core
+-from versao import REPO_GITHUB, VERSAO
++from versao import CHAVE_PUBLICA_ATUALIZACAO, REPO_GITHUB, VERSAO
+ 
+ log = logging.getLogger(__name__)
+ 
+@@ -35,7 +41,9 @@ URL_API = f"https://api.github.com/repos/{REPO_GITHUB}/releases/latest"
+ TIMEOUT_S = 30
+ TAMANHO_MAX = 800 * 1024 * 1024        # trava contra downloads absurdos
+ RE_VERSAO = re.compile(r"^v?(\d+)\.(\d+)\.(\d+)$")
+-RE_SHA256 = re.compile(r"\b([0-9a-fA-F]{64})\b")
++# conteudo do .sha256 gerado pelo workflow: "<hash>  <nome do instalador>"
++RE_LINHA_SHA256 = re.compile(r"^([0-9a-f]{64})  (\S+)\s*$")
++SUFIXO_ASSINATURA = ".sig"
+ 
+ 
+ class ErroAtualizacao(Exception):
+@@ -77,6 +85,41 @@ def _abrir(url: str, aceitar="application/octet-stream"):
+     return resp
+ 
+ 
++# --------------------------------------------------------------------------
++# Assinatura (Ed25519)
++# --------------------------------------------------------------------------
++
++def verificar_assinatura(conteudo: bytes, assinatura_txt: str, chave_b64: str = None):
++    """
++    Confere se 'conteudo' foi assinado pela chave privada do desenvolvedor.
++    Levanta ErroAtualizacao se a assinatura faltar, estiver malformada ou nao conferir.
++    """
++    chave_b64 = (CHAVE_PUBLICA_ATUALIZACAO if chave_b64 is None else chave_b64).strip()
++    if not chave_b64:
++        raise ErroAtualizacao("Esta versão do programa não tem a chave de verificação de "
++                              "atualizações. Por segurança, a atualização não será feita.")
++    try:
++        from cryptography.exceptions import InvalidSignature
++        from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
++    except ImportError:
++        raise ErroAtualizacao("Componente de verificação de assinatura ausente. "
++                              "Por segurança, a atualização não será feita.")
++    try:
++        chave = Ed25519PublicKey.from_public_bytes(base64.b64decode(chave_b64, validate=True))
++        assinatura = base64.b64decode((assinatura_txt or "").strip(), validate=True)
++    except (binascii.Error, ValueError):
++        raise ErroAtualizacao("Assinatura da atualização em formato inválido. "
++                              "Por segurança, a atualização não será feita.")
++    if len(assinatura) != 64:
++        raise ErroAtualizacao("Assinatura da atualização em formato inválido. "
++                              "Por segurança, a atualização não será feita.")
++    try:
++        chave.verify(assinatura, conteudo)
++    except InvalidSignature:
++        raise ErroAtualizacao("A assinatura da atualização NÃO confere: ela não foi publicada "
++                              "pelo desenvolvedor. A atualização foi cancelada.")
++
++
+ # --------------------------------------------------------------------------
+ # Versoes
+ # --------------------------------------------------------------------------
+@@ -126,10 +169,11 @@ def buscar_atualizacao():
+     nome = f"BuscaDatabook-Setup-{versao_txt}.exe"
+     assets = {a.get("name"): a for a in dados.get("assets", [])}
+     exe, sha = assets.get(nome), assets.get(nome + ".sha256")
+-    if not exe or not sha:
++    sig = assets.get(nome + ".sha256" + SUFIXO_ASSINATURA)
++    if not exe or not sha or not sig:
+         raise ErroAtualizacao(
+-            f"A versão {versao_txt} foi publicada sem o instalador ou sem o arquivo de "
+-            "verificação SHA-256. Por segurança, a atualização não será feita.")
++            f"A versão {versao_txt} foi publicada sem o instalador, sem o arquivo de "
++            "verificação SHA-256 ou sem a assinatura. Por segurança, a atualização não será feita.")
+     return {
+         "versao": versao_txt,
+         "nome": nome,
+@@ -137,17 +181,27 @@ def buscar_atualizacao():
+         "url": exe["browser_download_url"],
+         "tamanho": int(exe.get("size") or 0),
+         "url_sha256": sha["browser_download_url"],
++        "url_assinatura": sig["browser_download_url"],
+         "digest_github": (exe.get("digest") or "").lower(),
+     }
+ 
+ 
+ def _hash_publicado(info) -> str:
++    """SHA-256 esperado do instalador, so depois de conferir a assinatura do .sha256."""
+     with _abrir(info["url_sha256"]) as r:
+-        texto = r.read(4096).decode("ascii", "replace")
+-    m = RE_SHA256.search(texto)
++        conteudo = r.read(4096)
++    with _abrir(info["url_assinatura"]) as r:
++        assinatura = r.read(1024).decode("ascii", "replace")
++    verificar_assinatura(conteudo, assinatura)          # bytes exatos que foram assinados
++    texto = conteudo.decode("ascii", "replace")
++    m = RE_LINHA_SHA256.match(texto)
+     if not m:
+         raise ErroAtualizacao("O arquivo de verificação SHA-256 está vazio ou inválido.")
+-    esperado = m.group(1).lower()
++    if m.group(2) != info["nome"]:
++        # a assinatura vale para um instalador especifico: impede reaproveitar a de outra versao
++        raise ErroAtualizacao("O arquivo de verificação assinado é de outro instalador. "
++                              "A atualização foi cancelada.")
++    esperado = m.group(1)
+     dg = info.get("digest_github", "")
+     if dg.startswith("sha256:") and dg[7:] != esperado:
+         raise ErroAtualizacao("O SHA-256 publicado não confere com o calculado pelo GitHub.")
+diff --git a/src/versao.py b/src/versao.py
+index 5d9469f..5457854 100644
+--- a/src/versao.py
++++ b/src/versao.py
+@@ -3,9 +3,18 @@
+ Para publicar uma nova versao:
+   1. altere VERSAO abaixo (formato X.Y.Z);
+   2. faca commit e crie a tag correspondente:  git tag vX.Y.Z && git push --tags
++  3. o GitHub Actions gera o instalador e cria a release como RASCUNHO;
++  4. baixe o .sha256 do rascunho, assine no seu computador
++     (python tools/assinar_release.py assinar <arquivo.sha256>),
++     anexe o .sig ao rascunho e so entao publique.
+ O GitHub Actions confere se a tag bate com este arquivo antes de gerar o instalador.
+ """
+ 
+ APP_NOME = "Busca Databook"
+-VERSAO = "3.4.1"
++VERSAO = "3.5.0"
+ REPO_GITHUB = "AlexandreTavares75/busca-databook"
++
++# Chave PUBLICA (Ed25519, base64) que confere a assinatura das atualizacoes.
++# Gerada com:  python tools/assinar_release.py gerar-chave
++# A chave PRIVADA correspondente nunca entra no repositorio.
++CHAVE_PUBLICA_ATUALIZACAO = ""
+diff --git a/tools/assinar_release.py b/tools/assinar_release.py
+new file mode 100644
+index 0000000..759a05b
+--- /dev/null
++++ b/tools/assinar_release.py
+@@ -0,0 +1,172 @@
++"""
++Assinatura das atualizacoes do Busca Databook (Ed25519).
++
++Roda no computador do desenvolvedor, NUNCA no GitHub. Requer:  pip install cryptography
++
++  1) Uma unica vez - criar o par de chaves:
++       python tools/assinar_release.py gerar-chave
++     Pede uma senha (protege a chave privada) e mostra a chave PUBLICA, que deve
++     ser copiada para CHAVE_PUBLICA_ATUALIZACAO em src/versao.py.
++     A chave privada fica em %USERPROFILE%\\BuscaDatabook-chave\\chave_privada.pem.
++     Faca uma copia dela num pendrive guardado: sem ela nao ha como publicar
++     atualizacoes que os programas instalados aceitem.
++
++  2) A cada versao - assinar o .sha256 baixado do rascunho da release:
++       python tools/assinar_release.py assinar BuscaDatabook-Setup-X.Y.Z.exe.sha256
++     Gera BuscaDatabook-Setup-X.Y.Z.exe.sha256.sig ao lado. Anexe o .sig ao
++     rascunho da release e publique.
++
++  3) Opcional - conferir uma assinatura com a chave de src/versao.py:
++       python tools/assinar_release.py verificar BuscaDatabook-Setup-X.Y.Z.exe.sha256
++"""
++
++import argparse
++import base64
++import getpass
++import os
++import re
++import sys
++from pathlib import Path
++
++RAIZ = Path(__file__).resolve().parent.parent
++CHAVE_PADRAO = Path(os.environ.get("USERPROFILE") or Path.home()) / "BuscaDatabook-chave" / "chave_privada.pem"
++RE_LINHA = re.compile(rb"^[0-9a-f]{64}  BuscaDatabook-Setup-\d+\.\d+\.\d+\.exe\s*$")
++SENHA_MIN = 12
++
++
++def _crypto():
++    try:
++        from cryptography.hazmat.primitives import serialization
++        from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
++        return serialization, Ed25519PrivateKey
++    except ImportError:
++        sys.exit("Instale o componente antes:  pip install cryptography")
++
++
++def _publica_b64(chave_privada) -> str:
++    serialization, _ = _crypto()
++    bruta = chave_privada.public_key().public_bytes(serialization.Encoding.Raw,
++                                                    serialization.PublicFormat.Raw)
++    return base64.b64encode(bruta).decode("ascii")
++
++
++def _chave_do_programa() -> str:
++    sys.path.insert(0, str(RAIZ / "src"))
++    try:
++        import versao
++        return (getattr(versao, "CHAVE_PUBLICA_ATUALIZACAO", "") or "").strip()
++    except Exception:
++        return ""
++
++
++def gerar_chave(args):
++    serialization, Ed25519PrivateKey = _crypto()
++    destino = Path(args.chave)
++    if destino.exists():
++        sys.exit(f"Já existe uma chave em {destino}. Por segurança, ela não será substituída.\n"
++                 "Se quiser mesmo trocar de chave, mova o arquivo antigo para outro lugar antes.")
++    try:
++        destino.resolve().relative_to(RAIZ)
++        sys.exit("Não grave a chave privada dentro da pasta do repositório. Escolha outra pasta.")
++    except ValueError:
++        pass
++    senha = getpass.getpass(f"Crie uma senha para a chave privada (mínimo {SENHA_MIN} caracteres): ")
++    if len(senha) < SENHA_MIN:
++        sys.exit(f"Senha curta demais (mínimo {SENHA_MIN} caracteres).")
++    if getpass.getpass("Repita a senha: ") != senha:
++        sys.exit("As senhas não conferem.")
++    chave = Ed25519PrivateKey.generate()
++    pem = chave.private_bytes(serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8,
++                              serialization.BestAvailableEncryption(senha.encode("utf-8")))
++    destino.parent.mkdir(parents=True, exist_ok=True)
++    with open(destino, "xb") as f:
++        f.write(pem)
++    print(f"\nChave privada criada em: {destino}")
++    print("  -> Faça AGORA uma cópia desse arquivo num pendrive e guarde a senha em lugar seguro.")
++    print("  -> Nunca envie esse arquivo por e-mail nem o coloque no GitHub.\n")
++    print("Chave PÚBLICA (copie para CHAVE_PUBLICA_ATUALIZACAO em src/versao.py):\n")
++    print(f'CHAVE_PUBLICA_ATUALIZACAO = "{_publica_b64(chave)}"\n')
++
++
++def _carregar_privada(caminho):
++    serialization, _ = _crypto()
++    caminho = Path(caminho)
++    if not caminho.is_file():
++        sys.exit(f"Chave privada não encontrada: {caminho}")
++    senha = getpass.getpass("Senha da chave privada: ")
++    try:
++        return serialization.load_pem_private_key(caminho.read_bytes(), senha.encode("utf-8"))
++    except (ValueError, TypeError):
++        sys.exit("Senha incorreta ou arquivo de chave inválido.")
++
++
++def _ler_sha256(caminho) -> bytes:
++    caminho = Path(caminho)
++    if not caminho.is_file():
++        sys.exit(f"Arquivo não encontrado: {caminho}")
++    conteudo = caminho.read_bytes()
++    if not RE_LINHA.match(conteudo):
++        sys.exit("Este não parece o .sha256 gerado pelo GitHub Actions "
++                 "(esperado: '<hash>  BuscaDatabook-Setup-X.Y.Z.exe').")
++    nome_no_arquivo = conteudo.split()[1].decode("ascii")
++    if caminho.name != nome_no_arquivo + ".sha256":
++        sys.exit(f"O nome do arquivo ({caminho.name}) não corresponde ao instalador "
++                 f"citado dentro dele ({nome_no_arquivo}).")
++    return conteudo
++
++
++def assinar(args):
++    conteudo = _ler_sha256(args.arquivo)
++    chave = _carregar_privada(args.chave)
++    publica = _publica_b64(chave)
++    do_programa = _chave_do_programa()
++    if do_programa and do_programa != publica:
++        sys.exit("ATENÇÃO: esta chave privada NÃO corresponde à chave pública de src/versao.py.\n"
++                 "Os programas instalados recusariam esta assinatura. Nada foi gravado.")
++    if not do_programa:
++        print("Aviso: src/versao.py ainda está sem CHAVE_PUBLICA_ATUALIZACAO.")
++    assinatura = chave.sign(conteudo)
++    chave.public_key().verify(assinatura, conteudo)          # autoteste
++    saida = Path(str(args.arquivo) + ".sig")
++    saida.write_text(base64.b64encode(assinatura).decode("ascii") + "\n", encoding="ascii")
++    print(f"Assinatura gravada em: {saida}")
++    print("Agora anexe esse .sig ao rascunho da release no GitHub e publique.")
++
++
++def verificar(args):
++    conteudo = _ler_sha256(args.arquivo)
++    sig = Path(str(args.arquivo) + ".sig")
++    if not sig.is_file():
++        sys.exit(f"Assinatura não encontrada: {sig}")
++    chave = args.publica or _chave_do_programa()
++    if not chave:
++        sys.exit("Informe a chave pública (--publica) ou preencha src/versao.py.")
++    sys.path.insert(0, str(RAIZ / "src"))
++    import updater
++    try:
++        updater.verificar_assinatura(conteudo, sig.read_text(encoding="ascii"), chave)
++    except updater.ErroAtualizacao as e:
++        sys.exit(f"FALHOU: {e}")
++    print("OK: assinatura válida para esta chave pública.")
++
++
++def main():
++    ap = argparse.ArgumentParser(description="Assinatura das atualizações do Busca Databook")
++    sub = ap.add_subparsers(dest="comando", required=True)
++    g = sub.add_parser("gerar-chave", help="cria o par de chaves (uma única vez)")
++    g.add_argument("--chave", default=str(CHAVE_PADRAO), help="onde gravar a chave privada")
++    g.set_defaults(func=gerar_chave)
++    a = sub.add_parser("assinar", help="assina o .sha256 de uma release")
++    a.add_argument("arquivo", help="BuscaDatabook-Setup-X.Y.Z.exe.sha256")
++    a.add_argument("--chave", default=str(CHAVE_PADRAO), help="arquivo da chave privada")
++    a.set_defaults(func=assinar)
++    v = sub.add_parser("verificar", help="confere a assinatura de um .sha256")
++    v.add_argument("arquivo", help="BuscaDatabook-Setup-X.Y.Z.exe.sha256")
++    v.add_argument("--publica", help="chave pública em base64 (padrão: a de src/versao.py)")
++    v.set_defaults(func=verificar)
++    args = ap.parse_args()
++    args.func(args)
++
++
++if __name__ == "__main__":
++    main()
+-- 
+2.43.0
+

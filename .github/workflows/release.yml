@@ -1,7 +1,12 @@
 name: Build e Release
 
-# Gera o instalador a cada tag vX.Y.Z e publica na aba Releases.
-# "Run workflow" manual gera o instalador como artefato, sem publicar.
+# Gera o instalador a cada tag vX.Y.Z e cria a release como RASCUNHO (draft).
+# O rascunho nao aparece para os programas instalados. Para liberar:
+#   1. baixe o .sha256 do rascunho;
+#   2. assine no seu computador: python tools/assinar_release.py assinar <arquivo.sha256>
+#   3. anexe o .sig gerado ao rascunho e clique em "Publish release".
+# Sem o .sig valido, os programas instalados (3.5.0+) recusam a atualizacao.
+# "Run workflow" manual gera o instalador como artefato, sem criar release.
 on:
   push:
     tags: ["v*.*.*"]
@@ -49,6 +54,13 @@ jobs:
             throw "A tag '$($env:REF_NAME)' não corresponde a src/versao.py (v$v)."
           }
           Add-Content -Path $env:GITHUB_OUTPUT -Value "versao=$v"
+
+      - name: Conferir chave pública de atualização
+        run: |
+          $k = python -c "import sys; sys.path.insert(0, 'src'); import versao; print(versao.CHAVE_PUBLICA_ATUALIZACAO)"
+          if ($k.Trim().Length -ne 44) {
+            throw "CHAVE_PUBLICA_ATUALIZACAO vazia ou inválida em src/versao.py. Gere com: python tools/assinar_release.py gerar-chave"
+          }
 
       - name: Instalar dependências
         run: |
@@ -115,7 +127,7 @@ jobs:
           path: output/
           if-no-files-found: error
 
-      - name: Publicar release
+      - name: Criar release (rascunho)
         if: github.event_name == 'push' && github.ref_type == 'tag'
         env:
           GH_TOKEN: ${{ github.token }}
@@ -124,6 +136,7 @@ jobs:
         run: |
           $exe = "output\BuscaDatabook-Setup-$env:VERSAO.exe"
           gh release create $env:TAG $exe "$exe.sha256" `
+            --draft `
             --repo $env:GITHUB_REPOSITORY `
             --title "Busca Databook $env:VERSAO" `
             --generate-notes

@@ -1,10 +1,18 @@
-BUSCA DATABOOK 3.4
+BUSCA DATABOOK 3.5
 ==================
 
 Programa para Windows que procura uma palavra (ex.: "Trafo") dentro dos
 documentos de uma pasta e de todas as suas subpastas: no PC, na rede
 (ex.: \\servidor\projetos ou uma unidade mapeada) ou na nuvem sincronizada
 (OneDrive, Google Drive para computador, SharePoint sincronizado).
+
+
+NOVIDADES DA 3.5
+----------------
+- Atualizações assinadas: além de conferir o SHA-256, o programa só instala
+  uma versão nova se ela tiver a assinatura digital do desenvolvedor. Nem
+  quem invadisse a conta do GitHub conseguiria publicar uma atualização
+  aceita. Não muda nada no uso do dia a dia.
 
 
 NOVIDADES DA 3.4
@@ -107,8 +115,9 @@ ATUALIZAÇÕES
 Ao abrir (no máximo uma vez por dia) o programa consulta o GitHub.
 Também dá para verificar em Ajuda > Verificar atualizações, e desligar a
 verificação automática no mesmo menu.
-Segurança: só baixa de endereços do GitHub via HTTPS e só instala se o
-SHA-256 do arquivo baixado for igual ao publicado na release.
+Segurança: só baixa de endereços do GitHub via HTTPS, confere a assinatura
+digital do desenvolvedor (versão 3.5 em diante) e só instala se o SHA-256
+do arquivo baixado for igual ao assinado.
 
 
 ONDE FICAM OS DADOS

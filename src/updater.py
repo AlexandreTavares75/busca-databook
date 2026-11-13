@@ -7,13 +7,19 @@ Fluxo:
      "BuscaDatabook-Setup-X.Y.Z.exe" e o arquivo "...exe.sha256";
   3. baixa o instalador para %LOCALAPPDATA%\\BuscaDatabook\\atualizacoes,
      calculando o SHA-256 durante o download;
-  4. so instala se o hash bater com o .sha256 publicado (e com o digest que o
+  4. confere a ASSINATURA do .sha256 (arquivo "...exe.sha256.sig") com a chave
+     publica embutida no programa (versao.CHAVE_PUBLICA_ATUALIZACAO). A chave
+     privada fica so no computador do desenvolvedor, fora do GitHub: mesmo quem
+     invadir a conta ou o repositorio nao consegue publicar uma atualizacao aceita;
+  5. so instala se o hash bater com o .sha256 assinado (e com o digest que o
      proprio GitHub calcula no upload, quando disponivel);
-  5. confere o hash de novo imediatamente antes de executar.
+  6. confere o hash de novo imediatamente antes de executar.
 
 Somente HTTPS e somente hosts do GitHub, inclusive nos redirecionamentos.
 """
 
+import base64
+import binascii
 import hashlib
 import json
 import logging
@@ -27,7 +33,7 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 import core
-from versao import REPO_GITHUB, VERSAO
+from versao import CHAVE_PUBLICA_ATUALIZACAO, REPO_GITHUB, VERSAO
 
 log = logging.getLogger(__name__)
 
@@ -35,7 +41,9 @@ URL_API = f"https://api.github.com/repos/{REPO_GITHUB}/releases/latest"
 TIMEOUT_S = 30
 TAMANHO_MAX = 800 * 1024 * 1024        # trava contra downloads absurdos
 RE_VERSAO = re.compile(r"^v?(\d+)\.(\d+)\.(\d+)$")
-RE_SHA256 = re.compile(r"\b([0-9a-fA-F]{64})\b")
+# conteudo do .sha256 gerado pelo workflow: "<hash>  <nome do instalador>"
+RE_LINHA_SHA256 = re.compile(r"^([0-9a-f]{64})  (\S+)\s*$")
+SUFIXO_ASSINATURA = ".sig"
 
 
 class ErroAtualizacao(Exception):
@@ -75,6 +83,41 @@ def _abrir(url: str, aceitar="application/octet-stream"):
     resp = opener.open(req, timeout=TIMEOUT_S)
     _checar_url(resp.geturl())
     return resp
+
+
+# --------------------------------------------------------------------------
+# Assinatura (Ed25519)
+# --------------------------------------------------------------------------
+
+def verificar_assinatura(conteudo: bytes, assinatura_txt: str, chave_b64: str = None):
+    """
+    Confere se 'conteudo' foi assinado pela chave privada do desenvolvedor.
+    Levanta ErroAtualizacao se a assinatura faltar, estiver malformada ou nao conferir.
+    """
+    chave_b64 = (CHAVE_PUBLICA_ATUALIZACAO if chave_b64 is None else chave_b64).strip()
+    if not chave_b64:
+        raise ErroAtualizacao("Esta versão do programa não tem a chave de verificação de "
+                              "atualizações. Por segurança, a atualização não será feita.")
+    try:
+        from cryptography.exceptions import InvalidSignature
+        from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+    except ImportError:
+        raise ErroAtualizacao("Componente de verificação de assinatura ausente. "
+                              "Por segurança, a atualização não será feita.")
+    try:
+        chave = Ed25519PublicKey.from_public_bytes(base64.b64decode(chave_b64, validate=True))
+        assinatura = base64.b64decode((assinatura_txt or "").strip(), validate=True)
+    except (binascii.Error, ValueError):
+        raise ErroAtualizacao("Assinatura da atualização em formato inválido. "
+                              "Por segurança, a atualização não será feita.")
+    if len(assinatura) != 64:
+        raise ErroAtualizacao("Assinatura da atualização em formato inválido. "
+                              "Por segurança, a atualização não será feita.")
+    try:
+        chave.verify(assinatura, conteudo)
+    except InvalidSignature:
+        raise ErroAtualizacao("A assinatura da atualização NÃO confere: ela não foi publicada "
+                              "pelo desenvolvedor. A atualização foi cancelada.")
 
 
 # --------------------------------------------------------------------------
@@ -126,10 +169,11 @@ def buscar_atualizacao():
     nome = f"BuscaDatabook-Setup-{versao_txt}.exe"
     assets = {a.get("name"): a for a in dados.get("assets", [])}
     exe, sha = assets.get(nome), assets.get(nome + ".sha256")
-    if not exe or not sha:
+    sig = assets.get(nome + ".sha256" + SUFIXO_ASSINATURA)
+    if not exe or not sha or not sig:
         raise ErroAtualizacao(
-            f"A versão {versao_txt} foi publicada sem o instalador ou sem o arquivo de "
-            "verificação SHA-256. Por segurança, a atualização não será feita.")
+            f"A versão {versao_txt} foi publicada sem o instalador, sem o arquivo de "
+            "verificação SHA-256 ou sem a assinatura. Por segurança, a atualização não será feita.")
     return {
         "versao": versao_txt,
         "nome": nome,
@@ -137,17 +181,27 @@ def buscar_atualizacao():
         "url": exe["browser_download_url"],
         "tamanho": int(exe.get("size") or 0),
         "url_sha256": sha["browser_download_url"],
+        "url_assinatura": sig["browser_download_url"],
         "digest_github": (exe.get("digest") or "").lower(),
     }
 
 
 def _hash_publicado(info) -> str:
+    """SHA-256 esperado do instalador, so depois de conferir a assinatura do .sha256."""
     with _abrir(info["url_sha256"]) as r:
-        texto = r.read(4096).decode("ascii", "replace")
-    m = RE_SHA256.search(texto)
+        conteudo = r.read(4096)
+    with _abrir(info["url_assinatura"]) as r:
+        assinatura = r.read(1024).decode("ascii", "replace")
+    verificar_assinatura(conteudo, assinatura)          # bytes exatos que foram assinados
+    texto = conteudo.decode("ascii", "replace")
+    m = RE_LINHA_SHA256.match(texto)
     if not m:
         raise ErroAtualizacao("O arquivo de verificação SHA-256 está vazio ou inválido.")
-    esperado = m.group(1).lower()
+    if m.group(2) != info["nome"]:
+        # a assinatura vale para um instalador especifico: impede reaproveitar a de outra versao
+        raise ErroAtualizacao("O arquivo de verificação assinado é de outro instalador. "
+                              "A atualização foi cancelada.")
+    esperado = m.group(1)
     dg = info.get("digest_github", "")
     if dg.startswith("sha256:") and dg[7:] != esperado:
         raise ErroAtualizacao("O SHA-256 publicado não confere com o calculado pelo GitHub.")

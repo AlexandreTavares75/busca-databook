@@ -32,10 +32,13 @@ log = logging.getLogger("app")
 
 CONFIG = core.pasta_dados_app() / "config.json"
 ARQUIVO_LOG = core.pasta_dados_app() / "erro.log"
+ARQUIVO_AUDITORIA = core.pasta_dados_app() / "auditoria.log"
 MUTEX_NOME = "BuscaDatabook_Instancia"   # o instalador espera o programa fechar por este nome
 INTERVALO_VERIFICACAO_S = 24 * 3600      # verifica atualizacoes no maximo 1x por dia
 TENTATIVAS_LOGIN = 5
 BLOQUEIO_LOGIN_S = 30
+BLOQUEIO_INATIVIDADE_MIN = 15            # padrao; o usuario escolhe 5 a 60 em Opcoes
+OPCOES_INATIVIDADE_MIN = (5, 10, 15, 30, 60)
 
 # Menu lateral
 LARGURA_MENU = 220
@@ -179,6 +182,11 @@ def configurar_log():
     h = RotatingFileHandler(ARQUIVO_LOG, maxBytes=1_000_000, backupCount=2, encoding="utf-8")
     h.setFormatter(logging.Formatter("%(asctime)s %(levelname)s [%(name)s] %(message)s"))
     logging.basicConfig(level=logging.INFO, handlers=[h], force=True)
+    # auditoria (LGPD): arquivo proprio, guardado por mais tempo (~20 MB)
+    ha = RotatingFileHandler(ARQUIVO_AUDITORIA, maxBytes=1_000_000, backupCount=20, encoding="utf-8")
+    ha.setFormatter(logging.Formatter("%(asctime)s | %(message)s", "%Y-%m-%d %H:%M:%S"))
+    core.log_auditoria.handlers[:] = [ha]
+    core.log_auditoria.setLevel(logging.INFO)
 
     def gancho(tipo, valor, tb):
         logging.critical("Erro não tratado", exc_info=(tipo, valor, tb))
@@ -394,12 +402,14 @@ class TelaLogin(tk.Toplevel):
             try:
                 self.usuarios.criar(user, senha, admin=True)
                 log.info("Administrador inicial criado: %s", user.strip().lower())
+                core.auditar(user.strip().lower(), "usuário criado", "administrador inicial")
             except Exception as e:
                 messagebox.showerror(APP_NOME, str(e), parent=self)
                 return
         r = self.usuarios.validar(user, senha)
         if not r:
             log.warning("Falha de login (usuário informado: %r)", user.strip().lower()[:64])
+            core.auditar(user.strip().lower()[:64], "falha de login")
             self.e_senha.delete(0, "end")
             extra = (f"\n\nMuitas tentativas: aguarde {BLOQUEIO_LOGIN_S} segundos."
                      if self.registrar_falha() else "")
@@ -424,12 +434,14 @@ class TelaLogin(tk.Toplevel):
                 self.e_senha.delete(0, "end")
                 return
             log.info("Senha fora da regra trocada no login: %s", r["login"])
+            core.auditar(r["login"], "senha trocada", "senha antiga fora da regra")
         if not r["tem_codigo"]:
             # todo usuario recebe um codigo de recuperacao (inclusive os que ja existiam)
             mostrar_codigo(self, self.usuarios.gerar_codigo(r["login"]))
             log.info("Código de recuperação gerado para %s", r["login"])
 
         log.info("Login: %s", r["login"])
+        core.auditar(r["login"], "login")
         self.resultado = r
         self.destroy()
 
@@ -491,6 +503,7 @@ class TelaNovaSenha(tk.Toplevel):
             messagebox.showerror(APP_NOME, str(e), parent=self)
             return
         log.info("Usuário %s definiu nova senha", self.login)
+        core.auditar(self.login, "senha alterada")
         self.ok = True
         self.destroy()
 
@@ -592,6 +605,7 @@ class TelaRecuperar(tk.Toplevel):
             return
         if not novo_codigo:
             log.warning("Recuperação de senha recusada (usuário informado: %r)", login.strip().lower()[:64])
+            core.auditar(login.strip().lower()[:64], "recuperação de senha recusada")
             extra = (f"\n\nMuitas tentativas: aguarde {BLOQUEIO_LOGIN_S} segundos."
                      if self.login_tela.registrar_falha() else "")
             messagebox.showerror(APP_NOME, "Usuário ou código de recuperação incorretos.\n"
@@ -599,6 +613,7 @@ class TelaRecuperar(tk.Toplevel):
                                            "redefinir a sua senha." + extra, parent=self)
             return
         log.info("Senha recuperada com código: %s", login.strip().lower())
+        core.auditar(login.strip().lower(), "senha recuperada com código")
         messagebox.showinfo(APP_NOME, "Senha alterada!\n\nO código usado deixou de valer. "
                                       "Na próxima tela está o seu NOVO código de recuperação.", parent=self)
         mostrar_codigo(self, novo_codigo)
@@ -661,6 +676,7 @@ class TelaUsuarios(tk.Toplevel):
         try:
             senha = self.usuarios.criar(login, None, admin)       # gera senha provisoria
             log.info("Usuário criado por %s: %s (admin=%s)", self.atual, login.strip().lower(), admin)
+            core.auditar(self.atual, "usuário criado", f"{login.strip().lower()} (administrador: {'sim' if admin else 'não'})")
         except Exception as e:
             messagebox.showerror("Usuários", f"Não foi possível criar: {e}", parent=self)
             return
@@ -681,6 +697,7 @@ class TelaUsuarios(tk.Toplevel):
             return
         senha = self.usuarios.redefinir(s)
         log.info("Senha de %s redefinida (provisória) por %s", s, self.atual)
+        core.auditar(self.atual, "senha redefinida (provisória)", s)
         self.recarregar()
         self._mostrar_provisoria(s, senha)
 
@@ -694,6 +711,7 @@ class TelaUsuarios(tk.Toplevel):
         if messagebox.askyesno("Usuários", f"Excluir o usuário {s}?", parent=self):
             self.usuarios.remover(s)
             log.info("Usuário %s excluído por %s", s, self.atual)
+            core.auditar(self.atual, "usuário excluído", s)
             self.recarregar()
 
 
@@ -758,6 +776,283 @@ class TelaExportar(tk.Toplevel):
         else:
             self.resultado = ([self.empresas[i][1] for i in sel], fora)
         self.destroy()
+
+
+class TelaSenhaArquivo(tk.Toplevel):
+    """Senha de um indice exportado / pacote. criar=True: definir (com confirmacao e "Gerar senha");
+    criar=False: digitar para abrir. resultado: a senha ou None."""
+
+    def __init__(self, master, criar, titulo, texto=""):
+        super().__init__(master)
+        self.criar = criar
+        self.resultado = None
+        self.title(titulo)
+        self.resizable(False, False)
+        f = ttk.Frame(self, padding=16)
+        f.pack(fill="both", expand=True)
+        if texto:
+            ttk.Label(f, text=texto, wraplength=420, justify="left").grid(row=0, column=0, columnspan=3,
+                                                                         sticky="w", pady=(0, 10))
+        self.var_ver = tk.BooleanVar(value=False)
+        ttk.Label(f, text="Senha:").grid(row=1, column=0, sticky="e", padx=4, pady=3)
+        self.e1 = ttk.Entry(f, width=34, show="•")
+        self.e1.grid(row=1, column=1, pady=3, sticky="w")
+        if criar:
+            ttk.Button(f, text="Gerar senha", command=self._gerar).grid(row=1, column=2, padx=(6, 0))
+            ttk.Label(f, text="Confirmar:").grid(row=2, column=0, sticky="e", padx=4, pady=3)
+            self.e2 = ttk.Entry(f, width=34, show="•")
+            self.e2.grid(row=2, column=1, pady=3, sticky="w")
+            ttk.Button(f, text="Copiar", command=self._copiar).grid(row=2, column=2, padx=(6, 0))
+            ttk.Label(f, foreground="#a0522d", wraplength=420, justify="left",
+                      text=f"Mínimo de {core.SENHA_ARQUIVO_MIN} caracteres. Anote a senha: sem ela o arquivo "
+                           "não pode ser aberto. Envie-a por um canal DIFERENTE do arquivo (ex.: telefone "
+                           "ou mensagem), nunca no mesmo e-mail.").grid(row=3, column=0, columnspan=3,
+                                                                        sticky="w", pady=(8, 0))
+        ttk.Checkbutton(f, text="Mostrar senha", variable=self.var_ver, command=self._ver).grid(
+            row=4, column=1, sticky="w", pady=(6, 0))
+        b = ttk.Frame(f)
+        b.grid(row=5, column=0, columnspan=3, sticky="e", pady=(12, 0))
+        ttk.Button(b, text="OK", command=self._ok).pack(side="left", padx=4)
+        ttk.Button(b, text="Cancelar", command=self.destroy).pack(side="left")
+        self.bind("<Return>", lambda e: self._ok())
+        self.bind("<Escape>", lambda e: self.destroy())
+        try:
+            if master.winfo_viewable():
+                self.transient(master)
+        except tk.TclError:
+            pass
+        self.lift()
+        self.e1.focus_set()
+        self.grab_set()
+
+    def _ver(self):
+        mostrar = "" if self.var_ver.get() else "•"
+        self.e1.config(show=mostrar)
+        if self.criar:
+            self.e2.config(show=mostrar)
+
+    def _gerar(self):
+        s = core.gerar_senha_arquivo()
+        for e in (self.e1, self.e2):
+            e.delete(0, "end")
+            e.insert(0, s)
+        self.var_ver.set(True)
+        self._ver()
+
+    def _copiar(self):
+        self.clipboard_clear()
+        self.clipboard_append(self.e1.get())
+
+    def _ok(self):
+        s = self.e1.get()
+        if self.criar:
+            if s != self.e2.get():
+                messagebox.showerror(self.title(), "As senhas não conferem.", parent=self)
+                return
+            try:
+                core.checar_senha_arquivo(s)
+            except ValueError as e:
+                messagebox.showerror(self.title(), str(e), parent=self)
+                return
+        elif not s:
+            return
+        self.resultado = s
+        self.destroy()
+
+
+class TelaProtecao(tk.Toplevel):
+    """Regras de protecao de dados pessoais (LGPD) da pasta principal. resultado: lista ou None."""
+
+    def __init__(self, master, regras):
+        super().__init__(master)
+        self.resultado = None
+        self.regras = [dict(r) for r in regras]
+        self.title("Proteção de dados pessoais (LGPD)")
+        self.resizable(False, False)
+        f = ttk.Frame(self, padding=14)
+        f.pack(fill="both", expand=True)
+        ttk.Label(f, wraplength=560, justify="left", text=(
+            "Pastas ou arquivos cujo caminho contém um destes termos (palavra inteira, sem diferenciar "
+            "acentos e maiúsculas) recebem proteção especial. Use para documentos com dados pessoais "
+            "sensíveis, como atestados de saúde (ASO) e exames.\n\n"
+            "• Só o nome: o arquivo aparece na busca pelo nome, mas o conteúdo não é lido.\n"
+            "• Ignorar: o arquivo não entra no índice.\n\n"
+            "As regras valem para esta pasta principal e viajam junto com o índice exportado ou o "
+            "pacote do cliente.")).grid(row=0, column=0, columnspan=4, sticky="w")
+        self.tv = ttk.Treeview(f, columns=("modo",), height=9, selectmode="extended")
+        self.tv.heading("#0", text="Termo")
+        self.tv.heading("modo", text="Proteção")
+        self.tv.column("#0", width=230)
+        self.tv.column("modo", width=300)
+        self.tv.grid(row=1, column=0, columnspan=4, sticky="ew", pady=(10, 4))
+        self.var_termo = tk.StringVar()
+        ttk.Entry(f, textvariable=self.var_termo, width=28).grid(row=2, column=0, sticky="w")
+        self.var_modo = tk.StringVar(value=core.MODOS_PROTECAO[core.MODO_SO_NOME])
+        ttk.Combobox(f, textvariable=self.var_modo, state="readonly", width=32,
+                     values=list(core.MODOS_PROTECAO.values())).grid(row=2, column=1, sticky="w", padx=6)
+        ttk.Button(f, text="Adicionar", command=self._adicionar).grid(row=2, column=2, sticky="w")
+        ttk.Button(f, text="Remover selecionadas", command=self._remover).grid(row=2, column=3, sticky="e")
+        ttk.Label(f, text="Sugestões (clique para adicionar como “Só o nome”):").grid(
+            row=3, column=0, columnspan=4, sticky="w", pady=(10, 2))
+        sug = ttk.Frame(f)
+        sug.grid(row=4, column=0, columnspan=4, sticky="w")
+        for i, t in enumerate(core.SUGESTOES_PROTECAO):
+            ttk.Button(sug, text=t, width=len(t) + 2,
+                       command=lambda t=t: self._incluir(t, core.MODO_SO_NOME)).grid(row=i // 7, column=i % 7,
+                                                                                    padx=2, pady=2, sticky="w")
+        b = ttk.Frame(f)
+        b.grid(row=5, column=0, columnspan=4, sticky="e", pady=(12, 0))
+        ttk.Button(b, text="Salvar e aplicar", command=self._salvar).pack(side="left", padx=4)
+        ttk.Button(b, text="Cancelar", command=self.destroy).pack(side="left")
+        self._recarregar()
+        self.transient(master)
+        self.grab_set()
+
+    def _recarregar(self):
+        self.tv.delete(*self.tv.get_children())
+        for i, r in enumerate(self.regras):
+            self.tv.insert("", "end", iid=str(i), text=r["termo"], values=(core.MODOS_PROTECAO[r["modo"]],))
+
+    def _incluir(self, termo, modo):
+        try:
+            self.regras = core.validar_regras(self.regras + [{"termo": termo, "modo": modo}])
+        except ValueError as e:
+            messagebox.showerror(self.title(), str(e), parent=self)
+            return False
+        self._recarregar()
+        return True
+
+    def _adicionar(self):
+        modo = next(k for k, v in core.MODOS_PROTECAO.items() if v == self.var_modo.get())
+        if self._incluir(self.var_termo.get(), modo):
+            self.var_termo.set("")
+
+    def _remover(self):
+        fora = {int(i) for i in self.tv.selection()}
+        self.regras = [r for i, r in enumerate(self.regras) if i not in fora]
+        self._recarregar()
+
+    def _salvar(self):
+        self.resultado = self.regras
+        self.destroy()
+
+
+class TelaTexto(tk.Toplevel):
+    """Janela de leitura (aviso de privacidade, registro de auditoria), com "Salvar cópia" opcional."""
+
+    def __init__(self, master, titulo, texto, salvar_como=None):
+        super().__init__(master)
+        self.title(titulo)
+        self.geometry("760x560")
+        f = ttk.Frame(self, padding=10)
+        f.pack(fill="both", expand=True)
+        t = tk.Text(f, wrap="word", font=("Segoe UI", 10), padx=8, pady=8)
+        sb = ttk.Scrollbar(f, orient="vertical", command=t.yview)
+        t.configure(yscrollcommand=sb.set)
+        t.pack(side="left", fill="both", expand=True)
+        sb.pack(side="right", fill="y")
+        t.insert("1.0", texto)
+        t.config(state="disabled")
+        b = ttk.Frame(self, padding=(10, 0, 10, 10))
+        b.pack(fill="x")
+        if salvar_como:
+            ttk.Button(b, text="Salvar cópia...", command=lambda: self._salvar(texto, salvar_como)).pack(side="left")
+        ttk.Button(b, text="Fechar", command=self.destroy).pack(side="right")
+        self.transient(master)
+
+    def _salvar(self, texto, nome):
+        destino = filedialog.asksaveasfilename(parent=self, initialfile=nome, defaultextension=".txt",
+                                               filetypes=[("Texto", "*.txt")])
+        if destino:
+            Path(destino).write_text(texto, encoding="utf-8")
+
+
+class TelaBloqueio(tk.Toplevel):
+    """Sessao bloqueada por inatividade: so a senha do proprio usuario desbloqueia.
+    As tarefas em andamento (ex.: indexacao) continuam."""
+
+    def __init__(self, app):
+        super().__init__(app.root)
+        self.app = app
+        self.falhas = 0
+        self.bloqueado_ate = 0.0
+        self.title(APP_NOME + " - Sessão bloqueada")
+        self.resizable(False, False)
+        self.protocol("WM_DELETE_WINDOW", lambda: None)
+        f = ttk.Frame(self, padding=20)
+        f.pack(fill="both", expand=True)
+        ttk.Label(f, text="Sessão bloqueada", font=("Segoe UI", 12, "bold")).grid(
+            row=0, column=0, columnspan=2, pady=(0, 6))
+        ttk.Label(f, text=f"Usuário: {app.usuario['login']}").grid(row=1, column=0, columnspan=2, pady=(0, 10))
+        ttk.Label(f, text="Senha:").grid(row=2, column=0, sticky="e", padx=4)
+        self.e = ttk.Entry(f, width=28, show="•")
+        self.e.grid(row=2, column=1, pady=4)
+        b = ttk.Frame(f)
+        b.grid(row=3, column=0, columnspan=2, pady=(12, 0))
+        ttk.Button(b, text="Desbloquear", command=self._desbloquear).pack(side="left", padx=4)
+        ttk.Button(b, text="Sair do programa", command=self._sair).pack(side="left", padx=4)
+        self.bind("<Return>", lambda e: self._desbloquear())
+        self.update_idletasks()
+        x = (self.winfo_screenwidth() - self.winfo_width()) // 2
+        y = (self.winfo_screenheight() - self.winfo_height()) // 3
+        self.geometry(f"+{x}+{y}")
+        self.lift()
+        self.e.focus_force()
+
+    def _desbloquear(self):
+        restante = self.bloqueado_ate - time.monotonic()
+        if restante > 0:
+            messagebox.showwarning(APP_NOME, f"Muitas tentativas. Aguarde {int(restante) + 1} segundos.", parent=self)
+            return
+        if self.app.usuarios.validar(self.app.usuario["login"], self.e.get()):
+            self.destroy()
+            self.app.desbloquear()
+            return
+        self.e.delete(0, "end")
+        core.auditar(self.app.usuario["login"], "falha ao desbloquear a sessão")
+        self.falhas += 1
+        extra = ""
+        if self.falhas >= TENTATIVAS_LOGIN:
+            self.falhas = 0
+            self.bloqueado_ate = time.monotonic() + BLOQUEIO_LOGIN_S
+            extra = f"\n\nMuitas tentativas: aguarde {BLOQUEIO_LOGIN_S} segundos."
+        messagebox.showerror(APP_NOME, "Senha incorreta." + extra, parent=self)
+
+    def _sair(self):
+        if self.app.trabalhando and not messagebox.askyesno(
+                APP_NOME, "Há uma tarefa em andamento. Sair mesmo assim?\n(O que já foi lido fica salvo.)",
+                parent=self):
+            return
+        self.destroy()
+        self.app.sair(forcar=True)
+
+
+AVISO_PRIVACIDADE = """PRIVACIDADE E PROTEÇÃO DE DADOS PESSOAIS (LGPD)
+
+O QUE O PROGRAMA GUARDA
+• Um índice com o texto extraído dos documentos da pasta principal. Esse texto pode conter dados pessoais (nomes, números de documentos, assinaturas) e até dados pessoais sensíveis (ex.: atestados de saúde).
+• Os usuários do programa (as senhas ficam guardadas só como hash, impossível de ler), as configurações, o registro de uso (auditoria.log) e o registro de erros (erro.log). O registro de uso não guarda o conteúdo dos documentos nem os termos pesquisados.
+Tudo fica somente neste computador, na pasta:
+{pasta}
+
+O QUE SAI DO COMPUTADOR
+• Nenhum conteúdo de documento é enviado pela internet: a leitura e o OCR são feitos neste computador.
+• O programa consulta o GitHub para verificar atualizações. Como em qualquer acesso a um site, o GitHub recebe o endereço de rede (IP) do computador. A verificação automática pode ser desligada em Opções.
+• Índices exportados e pacotes de cliente saem cifrados com senha (AES-256). Envie a senha por um canal diferente do arquivo.
+
+QUEM RESPONDE PELOS DADOS
+• O controlador dos dados é a organização dona dos documentos{controlador}. Pedidos e dúvidas dos titulares (confirmação, acesso, correção, eliminação) devem ser encaminhados ao encarregado de dados (DPO) dessa organização.
+
+BOAS PRÁTICAS
+• Cada pessoa com a sua própria conta do Windows e do programa. Nunca compartilhe senhas.
+• Mantenha a criptografia de disco do Windows (BitLocker) ligada: o login do programa protege as telas, mas o índice fica gravado na pasta acima.
+• Em Opções > Proteção de dados pessoais, marque pastas como ASO e exames para que o conteúdo não seja lido.
+• A sessão é bloqueada após um tempo sem uso (Opções > Bloquear após inatividade).
+• Ao fim do uso ou do contrato: Arquivo > Eliminar dados.
+
+INCIDENTES
+Em caso de perda, roubo ou vazamento (ex.: notebook extraviado, pacote enviado à pessoa errada), avise IMEDIATAMENTE o responsável pela organização dona dos documentos: a comunicação à ANPD tem prazo de 3 dias úteis.
+"""
 
 
 class TelaPacote(tk.Toplevel):
@@ -1093,6 +1388,11 @@ class App:
         self.empresa_nome = None
         self.temp_dir = tempfile.mkdtemp(prefix="buscadatabook_")
         self.ordem = {}
+        self.sessao_bloqueada = False
+        self._janelas_ocultas = []
+        self._msgs_adiadas = []          # mensagens de tarefas que terminaram com a sessao bloqueada
+        self._ultima_atividade = time.monotonic()
+        self._dados_apagados = False
 
         self._titulo()
         root.geometry(self.cfg.get("geometria", "1280x720"))
@@ -1106,6 +1406,9 @@ class App:
         self._carregar_pasta_inicial()
         self.root.after(100, self._processar_fila)
         self.root.after(3000, self._verificacao_automatica)
+        for ev in ("<Any-KeyPress>", "<Any-ButtonPress>", "<Motion>", "<MouseWheel>"):
+            root.bind_all(ev, self._atividade, add="+")
+        self.root.after(30_000, self._checar_inatividade)
 
     def _titulo(self):
         cliente = f" — {MARCA['cliente']}" if MARCA else ""
@@ -1135,14 +1438,23 @@ class App:
         arq.add_command(label="Recarregar lista de empresas", command=lambda: self._carregar_empresas(manter=True))
         arq.add_command(label="Arquivos que não puderam ser lidos", command=self.ver_erros)
         arq.add_separator()
-        arq.add_command(label="Exportar índice...", command=self.exportar_indice)
+        if self.usuario["admin"]:    # o arquivo exportado leva o texto dos documentos
+            arq.add_command(label="Exportar índice (com senha)...", command=self.exportar_indice)
         arq.add_command(label="Importar índice...", command=self.importar_indice)
         arq.add_separator()
         arq.add_command(label="Importar pacote do cliente...", command=lambda: self.importar_pacote())
         if self.usuario["admin"]:
             arq.add_command(label="Criar pacote do cliente...", command=self.criar_pacote)
             arq.add_command(label="Remover personalização do cliente", command=self.remover_personalizacao)
+            arq.add_separator()
+            elim = tk.Menu(arq, tearoff=0)
+            elim.add_command(label="Apagar o índice desta pasta...", command=self.apagar_indice_pasta)
+            elim.add_command(label="Apagar todos os dados do programa neste computador...",
+                             command=self.apagar_todos_os_dados)
+            arq.add_cascade(label="Eliminar dados (LGPD)", menu=elim)
+            arq.add_command(label="Registro de auditoria...", command=self.ver_auditoria)
         arq.add_separator()
+        arq.add_command(label="Bloquear sessão agora", command=self.bloquear)
         arq.add_command(label="Sair", command=self.sair)
         m.add_cascade(label="Arquivo", menu=arq)
 
@@ -1159,6 +1471,14 @@ class App:
                            variable=self.var_nuvem, command=self._salvar_cfg)
         op.add_checkbutton(label="Verificar atualizações do programa ao iniciar", variable=self.var_auto_upd,
                            command=self._salvar_cfg)
+        op.add_separator()
+        self.var_inativ = tk.IntVar(value=self._minutos_bloqueio())
+        sub = tk.Menu(op, tearoff=0)
+        for mnt in OPCOES_INATIVIDADE_MIN:
+            sub.add_radiobutton(label=f"{mnt} minutos", value=mnt, variable=self.var_inativ, command=self._salvar_cfg)
+        op.add_cascade(label="Bloquear após inatividade", menu=sub)
+        if self.usuario["admin"]:
+            op.add_command(label="Proteção de dados pessoais (LGPD)...", command=self.editar_protecao)
         m.add_cascade(label="Opções", menu=op)
 
         conta = tk.Menu(m, tearoff=0)
@@ -1170,6 +1490,7 @@ class App:
         aj = tk.Menu(m, tearoff=0)
         aj.add_command(label="Como buscar", command=lambda: messagebox.showinfo("Como buscar", DICAS))
         aj.add_command(label="Verificar atualizações", command=lambda: self._verificar_atualizacao(manual=True))
+        aj.add_command(label="Privacidade e proteção de dados (LGPD)", command=self.ver_privacidade)
         aj.add_separator()
         aj.add_command(label="Sobre", command=self._sobre)
         m.add_cascade(label="Ajuda", menu=aj)
@@ -1422,7 +1743,9 @@ class App:
             return
         if not messagebox.askyesno(APP_NOME, "Apagar o índice desta pasta e ler todos os arquivos novamente?"):
             return
+        regras = []
         if self.indice_busca:
+            regras = self.indice_busca.regras_protecao()      # as regras de protecao continuam valendo
             self.indice_busca.fechar()
             self.indice_busca = None
         db = core.caminho_indice(pasta)
@@ -1432,6 +1755,9 @@ class App:
             except OSError:
                 pass
         self.indice_busca = core.Indice(pasta)
+        if regras:
+            self.indice_busca.definir_regras_protecao(regras)
+        core.auditar(self.usuario["login"], "índice refeito do zero", pasta)
         self.atualizar_indice()
 
     def _tarefa_indexar(self, pasta, usar_ocr, liberar_nuvem, tentar_erros=False):
@@ -1459,7 +1785,12 @@ class App:
             while True:
                 msg = self.fila.get_nowait()
                 tipo = msg[0]
-                if tipo == "prog":
+                if self.sessao_bloqueada and tipo != "prog":
+                    self._msgs_adiadas.append(msg)    # nada aparece na tela com a sessao bloqueada
+                    continue
+                if tipo == "cb":                      # ("cb", funcao, args): roda na interface
+                    msg[1](*msg[2])
+                elif tipo == "prog":
                     ultimo_prog = msg
                 elif tipo == "fim":
                     self._fim_indexacao(msg[1])
@@ -1547,6 +1878,8 @@ class App:
     # ---- exportar / importar indice --------------------------------------
 
     def exportar_indice(self):
+        if not self.usuario["admin"]:
+            return
         if self.trabalhando:
             messagebox.showinfo(APP_NOME, "Aguarde o fim da tarefa em andamento (ou cancele).")
             return
@@ -1558,6 +1891,12 @@ class App:
         if tela.resultado is None:
             return
         pastas, fora = tela.resultado
+        ts = TelaSenhaArquivo(self.root, True, "Senha do índice exportado",
+                              "O índice exportado contém o texto dos documentos e será cifrado com esta senha.")
+        self.root.wait_window(ts)
+        senha = ts.resultado
+        if not senha:
+            return
         base = os.path.basename(self.indice_busca.raiz.rstrip("\\/")) or "Indice"
         destino = filedialog.asksaveasfilename(
             title="Salvar índice exportado", defaultextension=core.EXT_EXPORTACAO,
@@ -1572,7 +1911,9 @@ class App:
         def tarefa():
             idx = core.Indice(raiz)
             try:
-                self.fila.put(("exp_fim", idx.exportar(destino, pastas, fora), destino))
+                n = idx.exportar(destino, pastas, fora, senha=senha)
+                core.auditar(self.usuario["login"], "índice exportado (cifrado)", f"{n} arquivos -> {destino}")
+                self.fila.put(("exp_fim", n, destino))
             except Exception as e:
                 log.exception("Erro ao exportar índice")
                 self.fila.put(("exp_erro", str(e)))
@@ -1590,11 +1931,18 @@ class App:
             filetypes=[("Índice do Busca Databook", f"*{core.EXT_EXPORTACAO}"), ("Todos os arquivos", "*.*")])
         if not arq:
             return
-        try:
-            info = core.ler_exportacao(arq)
-        except ValueError as e:
-            messagebox.showerror(APP_NOME, str(e))
-            return
+        senha = None
+        if core.esta_cifrado(arq):
+            r = self._pedir_senha_arquivo("Importar índice", lambda s: core.ler_exportacao(arq, s))
+            if not r:
+                return
+            senha, info = r
+        else:
+            try:
+                info = core.ler_exportacao(arq)
+            except ValueError as e:
+                messagebox.showerror(APP_NOME, str(e))
+                return
         raiz = info["raiz"]
         resumo = (f"Índice com {info['arquivos']:,} arquivos".replace(",", ".")
                   + (f", exportado em {info['exportado_em']}" if info["exportado_em"] else "")
@@ -1618,7 +1966,9 @@ class App:
 
         def tarefa():
             try:
-                self.fila.put(("imp_fim", core.importar_indice(arq, nova), nova))
+                n = core.importar_indice(arq, nova, senha)
+                core.auditar(self.usuario["login"], "índice importado", f"{n} arquivos <- {arq}")
+                self.fila.put(("imp_fim", n, nova))
             except Exception as e:
                 log.exception("Erro ao importar índice")
                 self.fila.put(("imp_erro", str(e)))
@@ -1669,6 +2019,15 @@ class App:
             return
         self.cfg["ultimo_pacote"] = {"cliente": r["cliente"], "cor": r["cor"] or "", "logo": r["logo"] or ""}
         self._salvar_cfg()
+        senha = None
+        if r["incluir_indice"]:
+            ts = TelaSenhaArquivo(self.root, True, "Senha do pacote",
+                                  "O índice vai dentro do pacote cifrado com esta senha. O cliente vai precisar "
+                                  "dela para importar o pacote.")
+            self.root.wait_window(ts)
+            senha = ts.resultado
+            if not senha:
+                return
         nome = "".join(c if c.isalnum() or c in " -_" else "_" for c in r["cliente"]).strip() or "Cliente"
         destino = filedialog.asksaveasfilename(
             title="Salvar pacote do cliente", defaultextension=core.EXT_PACOTE,
@@ -1684,7 +2043,9 @@ class App:
             idx = core.Indice(raiz) if raiz else None
             try:
                 logo = open(r["logo"], "rb").read() if r["logo"] else None
-                m = core.criar_pacote(destino, r["cliente"], r["cor"], logo, idx, r["pastas"], r["fora"])
+                m = core.criar_pacote(destino, r["cliente"], r["cor"], logo, idx, r["pastas"], r["fora"], senha=senha)
+                core.auditar(self.usuario["login"], "pacote do cliente criado",
+                             f"{r['cliente']}: {(m['indice'] or {}).get('arquivos', 0)} arquivos -> {destino}")
                 self.fila.put(("pac_fim", m, destino))
             except Exception as e:
                 log.exception("Erro ao criar pacote")
@@ -1710,6 +2071,16 @@ class App:
         except ValueError as e:
             messagebox.showerror(APP_NOME, str(e))
             return
+        senha = None
+        if info["indice_cifrado"]:
+            def testar(s):
+                if not core.conferir_senha_pacote(arquivo, s):
+                    raise ValueError("Senha incorreta.")
+                return True
+            r = self._pedir_senha_arquivo(f"Pacote de {info['cliente']}", testar)
+            if not r:
+                return
+            senha = r[0]
         resumo = f"Pacote: {info['cliente']}" + (f" (criado em {info['criado_em']})" if info["criado_em"] else "")
         if info["tem_indice"] and info["indice"]:
             resumo += f"\nÍndice com {info['indice'].get('arquivos', 0):,} arquivos".replace(",", ".")
@@ -1737,7 +2108,8 @@ class App:
 
         def tarefa():
             try:
-                info2, n = core.importar_pacote(arquivo, nova)
+                info2, n = core.importar_pacote(arquivo, nova, senha)
+                core.auditar(self.usuario["login"], "pacote do cliente importado", f"{info2['cliente']}: {n} arquivos")
                 self.fila.put(("pim_fim", info2, n, nova))
             except Exception as e:
                 log.exception("Erro ao importar pacote")
@@ -1753,6 +2125,7 @@ class App:
                                          "(nome, cores e logomarca)?\n\nO índice e as buscas não são afetados."):
             core.remover_marca()
             log.info("Personalização do cliente removida")
+            core.auditar(self.usuario["login"], "personalização do cliente removida", MARCA["cliente"])
             self._reaplicar_tema()
 
     def _fim_exportar_importar(self, msg):
@@ -1763,9 +2136,12 @@ class App:
             self.lbl_status.config(text="Pacote do cliente criado.")
             det = (f"Índice: {m['indice']['arquivos']:,} arquivos".replace(",", ".") if m["indice"]
                    else "Sem índice (só a identidade visual).")
+            aviso = ("\n\nO índice está cifrado: envie a SENHA por um canal diferente do pacote "
+                     "(ex.: telefone ou mensagem)." if m["indice"] else "")
             messagebox.showinfo(APP_NOME, f"Pacote de “{m['cliente']}” criado:\n{destino}\n\n{det}\n\n"
-                                          "No computador do cliente: instale o programa e use Arquivo > "
-                                          "Importar pacote do cliente (ou dê dois cliques no arquivo).")
+                                          "No computador do cliente: instale o programa (versão 3.6 ou mais nova) "
+                                          "e use Arquivo > Importar pacote do cliente (ou dê dois cliques no "
+                                          "arquivo)." + aviso)
             return
         if tipo == "pim_fim":
             _, info, n, nova = msg
@@ -1786,6 +2162,7 @@ class App:
             _, n, destino = msg
             self.lbl_status.config(text=f"Índice exportado: {n} arquivos.")
             messagebox.showinfo(APP_NOME, f"{n:,} arquivos exportados para:\n{destino}".replace(",", ".")
+                                + "\n\nO arquivo está cifrado: envie a SENHA por um canal diferente do arquivo."
                                 + "\n\nNo outro computador: Arquivo > Importar índice.")
         elif tipo == "imp_fim":
             _, n, nova = msg
@@ -1800,6 +2177,205 @@ class App:
             acao = "exportar" if tipo == "exp_erro" else "importar"
             self.lbl_status.config(text=f"Não foi possível {acao} o índice.")
             messagebox.showerror(APP_NOME, f"Não foi possível {acao} o índice:\n{msg[1]}")
+
+    def _pedir_senha_arquivo(self, titulo, testar):
+        """Pede a senha ate acertar (no maximo TENTATIVAS_LOGIN vezes). testar(senha) devolve um resultado
+        ou levanta ValueError("Senha incorreta."). Devolve (senha, resultado) ou None."""
+        for tentativa in range(TENTATIVAS_LOGIN):
+            ts = TelaSenhaArquivo(self.root, False, titulo, "Este arquivo é protegido por senha. "
+                                  "Digite a senha informada por quem enviou o arquivo.")
+            self.root.wait_window(ts)
+            if not ts.resultado:
+                return None
+            try:
+                self.root.config(cursor="watch")
+                self.root.update_idletasks()
+                return ts.resultado, testar(ts.resultado)
+            except ValueError as e:
+                if str(e) != "Senha incorreta.":
+                    messagebox.showerror(APP_NOME, str(e))
+                    return None
+                core.auditar(self.usuario["login"], "senha de arquivo incorreta", titulo)
+                messagebox.showerror(APP_NOME, "Senha incorreta.")
+            finally:
+                self.root.config(cursor="")
+        messagebox.showerror(APP_NOME, "Muitas tentativas erradas. Confirme a senha com quem enviou o arquivo.")
+        return None
+
+    # ---- protecao de dados pessoais e eliminacao (LGPD) -----------------------
+
+    def editar_protecao(self):
+        if self.trabalhando:
+            messagebox.showinfo(APP_NOME, "Aguarde o fim da tarefa em andamento (ou cancele).")
+            return
+        if not self.indice_busca:
+            messagebox.showinfo(APP_NOME, "Escolha a pasta principal primeiro.")
+            return
+        tela = TelaProtecao(self.root, self.indice_busca.regras_protecao())
+        self.root.wait_window(tela)
+        if tela.resultado is None:
+            return
+        regras, raiz = tela.resultado, self.indice_busca.raiz
+        self._iniciar_tarefa("protecao", cancelavel=False)
+        self.lbl_status.config(text="Aplicando a proteção de dados ao índice...")
+
+        def tarefa():
+            idx = core.Indice(raiz)
+            try:
+                rem, so_nome = idx.definir_regras_protecao(regras)
+                core.auditar(self.usuario["login"], "regras de proteção alteradas",
+                             "; ".join(f"{r['termo']}={r['modo']}" for r in regras) or "(nenhuma)")
+                self.fila.put(("cb", self._fim_protecao, (rem, so_nome, None)))
+            except Exception as e:
+                log.exception("Erro ao aplicar a proteção")
+                self.fila.put(("cb", self._fim_protecao, (0, 0, str(e))))
+            finally:
+                idx.fechar()
+
+        threading.Thread(target=tarefa, daemon=True).start()
+
+    def _fim_protecao(self, rem, so_nome, erro):
+        self._terminar_tarefa()
+        self._atualizar_info()
+        if erro:
+            messagebox.showerror(APP_NOME, f"Não foi possível aplicar a proteção:\n{erro}")
+            return
+        self.resultados = []
+        self._mostrar_resultados()
+        self.lbl_status.config(text="Proteção de dados aplicada.")
+        messagebox.showinfo(APP_NOME, "Proteção de dados aplicada.\n\n"
+                                      f"{rem} arquivo(s) retirado(s) do índice.\n"
+                                      f"{so_nome} arquivo(s) passaram a ser buscados só pelo nome.\n\n"
+                                      "Ao remover uma regra, o conteúdo volta a ser lido na próxima "
+                                      "atualização do índice.")
+
+    def apagar_indice_pasta(self):
+        if self.trabalhando or not self.indice_busca:
+            messagebox.showinfo(APP_NOME, "Escolha a pasta e aguarde o fim de tarefas em andamento.")
+            return
+        raiz = self.indice_busca.raiz
+        conf = simpledialog.askstring(
+            "Apagar índice", f"Isto apaga o índice (e as regras de proteção) de:\n{raiz}\n\n"
+                             "Os documentos originais NÃO são apagados.\n\nPara confirmar, digite APAGAR:",
+            parent=self.root)
+        if (conf or "").strip().upper() != "APAGAR" or not self._confirmar_senha_atual("Apagar índice"):
+            return
+        self.indice_busca.fechar()
+        self.indice_busca = None
+        try:
+            core.apagar_indice(raiz)
+        except OSError as e:
+            messagebox.showerror(APP_NOME, f"Não foi possível apagar o índice:\n{e}")
+        core.auditar(self.usuario["login"], "índice apagado", raiz)
+        self.indice_busca = core.Indice(raiz)
+        self.resultados = []
+        self._mostrar_resultados()
+        self._atualizar_info()
+        messagebox.showinfo(APP_NOME, "Índice apagado.")
+
+    def apagar_todos_os_dados(self):
+        if self.trabalhando:
+            messagebox.showinfo(APP_NOME, "Aguarde o fim da tarefa em andamento (ou cancele).")
+            return
+        conf = simpledialog.askstring(
+            "Apagar todos os dados",
+            "Isto apaga TUDO o que o programa guarda neste usuário do Windows: índices, usuários e senhas, "
+            "configurações, personalização do cliente e registros.\n\nOs documentos originais NÃO são "
+            "apagados. O programa será fechado e, ao abrir de novo, começará do zero.\n\n"
+            "Para confirmar, digite APAGAR TUDO:", parent=self.root)
+        if (conf or "").strip().upper() != "APAGAR TUDO" or not self._confirmar_senha_atual("Apagar todos os dados"):
+            return
+        core.auditar(self.usuario["login"], "todos os dados do programa apagados")
+        if self.indice_busca:
+            self.indice_busca.fechar()
+            self.indice_busca = None
+        self.usuarios.fechar()
+        for lg in (logging.getLogger(), core.log_auditoria):
+            for h in list(lg.handlers):
+                h.close()
+                lg.removeHandler(h)
+        falhas = core.apagar_todos_os_dados()
+        self._dados_apagados = True
+        shutil.rmtree(self.temp_dir, ignore_errors=True)
+        if falhas:
+            messagebox.showwarning(APP_NOME, "Alguns itens não puderam ser apagados (podem estar em uso):\n\n"
+                                   + "\n".join(falhas[:15]) + f"\n\nApague manualmente a pasta:\n{core.pasta_dados_app()}")
+        else:
+            messagebox.showinfo(APP_NOME, "Todos os dados do programa foram apagados. O programa será fechado.")
+        self.root.destroy()
+
+    def ver_auditoria(self):
+        arquivos = sorted(core.pasta_dados_app().glob("auditoria.log*"),
+                          key=lambda p: -int(p.suffix[1:]) if p.suffix[1:].isdigit() else 0)
+        linhas = []
+        for a in arquivos:                 # do mais antigo (auditoria.log.20) ao atual
+            try:
+                linhas += a.read_text(encoding="utf-8", errors="replace").splitlines()
+            except OSError:
+                pass
+        texto = ("Registro de auditoria (data | usuário | evento | detalhe)\n\n"
+                 + ("\n".join(linhas[-20000:]) if linhas else "(vazio)"))
+        TelaTexto(self.root, "Registro de auditoria", texto,
+                  salvar_como=f"auditoria_busca_databook_{time.strftime('%Y-%m-%d')}.txt")
+
+    def ver_privacidade(self):
+        controlador = f" ({MARCA['cliente']})" if MARCA else ""
+        TelaTexto(self.root, "Privacidade e proteção de dados (LGPD)",
+                  AVISO_PRIVACIDADE.format(pasta=core.pasta_dados_app(), controlador=controlador))
+
+    # ---- bloqueio por inatividade -------------------------------------------
+
+    def _minutos_bloqueio(self):
+        m = self.cfg.get("bloqueio_min", BLOQUEIO_INATIVIDADE_MIN)
+        return m if m in OPCOES_INATIVIDADE_MIN else BLOQUEIO_INATIVIDADE_MIN
+
+    def _atividade(self, _e=None):
+        self._ultima_atividade = time.monotonic()
+
+    def _checar_inatividade(self):
+        try:
+            if (not self.sessao_bloqueada
+                    and time.monotonic() - self._ultima_atividade > self._minutos_bloqueio() * 60):
+                self.bloquear(automatico=True)
+        finally:
+            self.root.after(30_000, self._checar_inatividade)
+
+    def bloquear(self, automatico=False):
+        if self.sessao_bloqueada:
+            return
+        self.sessao_bloqueada = True
+        # janela modal aberta (grab): solta o grab, senao a tela de bloqueio nao recebe o teclado
+        self._grab_anterior = self.root.grab_current()
+        if self._grab_anterior:
+            self._grab_anterior.grab_release()
+        self._janelas_ocultas = [w for w in self.root.winfo_children()
+                                 if isinstance(w, tk.Toplevel) and w.winfo_viewable()]
+        for w in self._janelas_ocultas:
+            w.withdraw()
+        self.root.withdraw()
+        core.auditar(self.usuario["login"], "sessão bloqueada", "inatividade" if automatico else "pelo usuário")
+        TelaBloqueio(self)
+
+    def desbloquear(self):
+        self.root.deiconify()
+        for w in self._janelas_ocultas:
+            try:
+                w.deiconify()
+            except tk.TclError:
+                pass
+        self._janelas_ocultas = []
+        if getattr(self, "_grab_anterior", None):
+            try:
+                self._grab_anterior.grab_set()
+            except tk.TclError:
+                pass
+            self._grab_anterior = None
+        self.sessao_bloqueada = False
+        self._ultima_atividade = time.monotonic()
+        core.auditar(self.usuario["login"], "sessão desbloqueada")
+        for msg in self._msgs_adiadas:          # devolve a fila o que chegou durante o bloqueio
+            self.fila.put(msg)
+        self._msgs_adiadas = []
 
     # ---- busca ------------------------------------------------------------
 
@@ -1985,6 +2561,7 @@ class App:
             return False
         if not self.usuarios.validar(self.usuario["login"], atual):
             log.warning("Senha atual incorreta em '%s' (%s)", titulo, self.usuario["login"])
+            core.auditar(self.usuario["login"], "senha atual incorreta", titulo)
             messagebox.showerror(APP_NOME, "Senha atual incorreta.")
             return False
         return True
@@ -2005,6 +2582,7 @@ class App:
             return
         codigo = self.usuarios.gerar_codigo(self.usuario["login"])
         log.info("Novo código de recuperação gerado por %s", self.usuario["login"])
+        core.auditar(self.usuario["login"], "código de recuperação gerado")
         mostrar_codigo(self.root, codigo)
 
     # ---- atualizacao automatica do programa ------------------------------
@@ -2096,6 +2674,8 @@ class App:
                            ("ocultar_repetidos", "var_ocultar")):
             if hasattr(self, var):
                 self.cfg[chave] = bool(getattr(self, var).get())
+        if hasattr(self, "var_inativ"):
+            self.cfg["bloqueio_min"] = int(self.var_inativ.get())
         salvar_config(self.cfg)
 
     def sair(self, forcar=False):
@@ -2107,6 +2687,7 @@ class App:
         self.cancelar_flag.set()
         self.cfg["geometria"] = self.root.geometry()
         self._salvar_cfg()
+        core.auditar(self.usuario["login"], "saída do programa")
         if self.indice_busca:
             try:
                 self.indice_busca.fechar()
@@ -2138,6 +2719,7 @@ def main():
     log.info("Iniciando %s %s", APP_NOME, VERSAO)
     criar_mutex()
     updater.limpar_baixados()
+    core.limpar_temporarios()
     if sys.platform.startswith("win"):
         try:
             ctypes.windll.shcore.SetProcessDpiAwareness(1)  # nitidez em telas de alta resolução

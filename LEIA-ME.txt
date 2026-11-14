@@ -1,10 +1,35 @@
-BUSCA DATABOOK 3.5
+BUSCA DATABOOK 3.6
 ==================
 
 Programa para Windows que procura uma palavra (ex.: "Trafo") dentro dos
 documentos de uma pasta e de todas as suas subpastas: no PC, na rede
 (ex.: \\servidor\projetos ou uma unidade mapeada) ou na nuvem sincronizada
 (OneDrive, Google Drive para computador, SharePoint sincronizado).
+
+
+NOVIDADES DA 3.6 (PROTEÇÃO DE DADOS - LGPD)
+-------------------------------------------
+- Índices exportados e pacotes de cliente com índice saem CIFRADOS com
+  senha (AES-256). A senha é definida na hora (há o botão "Gerar senha") e
+  deve ir por um canal diferente do arquivo (ex.: telefone ou mensagem).
+  Quem importa digita a senha. Pacotes e índices antigos (sem senha)
+  continuam sendo aceitos. Exportar índice passou a ser só do administrador.
+- Proteção de dados pessoais (Opções > Proteção de dados pessoais, só
+  administrador): termos como "ASO" ou "Exames" fazem as pastas/arquivos
+  serem buscados só pelo nome (conteúdo não é lido) ou ficarem fora do
+  índice. As regras viajam com o índice e o pacote e valem no cliente.
+- Registro de auditoria (Arquivo > Registro de auditoria): logins, senhas,
+  usuários, exportações, pacotes, regras e eliminações. Não guarda o texto
+  dos documentos nem os termos pesquisados.
+- Eliminar dados (Arquivo > Eliminar dados): apagar o índice da pasta ou
+  todos os dados do programa. Ao desinstalar, o programa pergunta se deve
+  apagar os dados (atualizações nunca apagam).
+- Bloqueio da sessão após inatividade (padrão 15 min; Opções). A indexação
+  continua enquanto a sessão está bloqueada.
+- Senhas guardadas com 600 mil iterações (padrão OWASP). As senhas
+  existentes são reforçadas sozinhas no próximo login, sem troca.
+- Ajuda > Privacidade e proteção de dados: o que o programa guarda, o que
+  sai do computador e boas práticas.
 
 
 NOVIDADES DA 3.5

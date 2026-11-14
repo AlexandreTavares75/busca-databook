@@ -17,6 +17,7 @@ import re
 import secrets
 import shutil
 import sqlite3
+import struct
 import sys
 import threading
 import time
@@ -25,6 +26,16 @@ import zipfile
 from pathlib import Path
 
 log = logging.getLogger(__name__)
+# Registro de auditoria (LGPD, art. 37): quem fez o que e quando. Nunca grava o texto dos
+# documentos nem os termos pesquisados. O app configura o arquivo (auditoria.log).
+log_auditoria = logging.getLogger("buscadatabook.auditoria")
+log_auditoria.propagate = False
+
+
+def auditar(usuario, evento, detalhe=""):
+    """Grava um evento no registro de auditoria (uma linha, sem quebras)."""
+    limpo = lambda t: re.sub(r"[\r\n|]+", " ", str(t or "")).strip()[:500]
+    log_auditoria.info("%s | %s | %s", limpo(usuario) or "-", limpo(evento), limpo(detalhe))
 
 # --------------------------------------------------------------------------
 # Configuracao
@@ -582,6 +593,274 @@ def listar_empresas(raiz: str):
 
 
 # --------------------------------------------------------------------------
+# Criptografia dos arquivos que saem do computador (.bdx e indice do .bdpack)
+# --------------------------------------------------------------------------
+#
+# Formato (AES-256-GCM em blocos, chave derivada da senha com scrypt):
+#   cabecalho: MAGICA(8) | versao(1) | logN(1) | r(1) | p(1) | sal(16) | prefixo_nonce(7)
+#   registros: tipo(1) | tamanho(4) | dados cifrados (com etiqueta de 16 bytes)
+#     tipo 0 = metadados (JSON) - sempre o primeiro; permite conferir a senha na hora
+#     tipo 1 = bloco de dados;  tipo 2 = ultimo bloco (protege contra arquivo truncado)
+#   nonce = prefixo(7) | contador(4) | tipo(1);  o cabecalho inteiro e dado autenticado.
+
+MAGICA_CIFRA = b"BDCRYPT\x01"
+SENHA_ARQUIVO_MIN = 12
+_BLOCO_CIFRA = 4 << 20
+_CAB_CIFRA = struct.Struct(">8sBBBB16s7s")
+
+
+def esta_cifrado(arquivo) -> bool:
+    try:
+        with open(arquivo, "rb") as f:
+            return f.read(8) == MAGICA_CIFRA
+    except OSError:
+        return False
+
+
+def checar_senha_arquivo(senha):
+    if len(senha or "") < SENHA_ARQUIVO_MIN:
+        raise ValueError(f"A senha do arquivo precisa ter pelo menos {SENHA_ARQUIVO_MIN} caracteres "
+                         "(use “Gerar senha” para criar uma senha forte).")
+
+
+def gerar_senha_arquivo():
+    """Senha aleatoria forte e facil de ditar: XXXXX-XXXXX-XXXXX-XXXXX (~100 bits)."""
+    bruto = "".join(secrets.choice(ALFABETO_CODIGO) for _ in range(20))
+    return "-".join(bruto[i:i + 5] for i in range(0, 20, 5))
+
+
+def _chave_arquivo(senha, sal, log_n, r, p):
+    return hashlib.scrypt(senha.encode("utf-8"), salt=sal, n=1 << log_n, r=r, p=p,
+                          maxmem=1 << 28, dklen=32)
+
+
+def cifrar_arquivo(origem, destino, senha, meta=None):
+    """Cifra o arquivo `origem` em `destino` (gravacao atomica). meta: dict curto, tambem cifrado."""
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+    checar_senha_arquivo(senha)
+    sal, prefixo, log_n, r, p = os.urandom(16), os.urandom(7), 16, 8, 1
+    cab = _CAB_CIFRA.pack(MAGICA_CIFRA, 1, log_n, r, p, sal, prefixo)
+    aes = AESGCM(_chave_arquivo(senha, sal, log_n, r, p))
+    destino = Path(destino)
+    parcial = destino.with_name(destino.name + ".tmp")
+    cont = 0
+
+    def gravar(f, tipo, dados):
+        nonlocal cont
+        ct = aes.encrypt(prefixo + cont.to_bytes(4, "big") + bytes([tipo]), dados, cab)
+        f.write(bytes([tipo]) + len(ct).to_bytes(4, "big") + ct)
+        cont += 1
+
+    try:
+        with open(origem, "rb") as src, open(parcial, "wb") as f:
+            f.write(cab)
+            gravar(f, 0, json.dumps(meta or {}, ensure_ascii=False).encode("utf-8"))
+            atual = src.read(_BLOCO_CIFRA)
+            while True:
+                prox = src.read(_BLOCO_CIFRA)
+                gravar(f, 1 if prox else 2, atual)
+                if not prox:
+                    break
+                atual = prox
+        os.replace(parcial, destino)
+    except Exception:
+        try:
+            parcial.unlink()
+        except OSError:
+            pass
+        raise
+
+
+class _LeitorCifrado:
+    """Le um arquivo cifrado registro a registro (aceita qualquer objeto de arquivo binario)."""
+
+    def __init__(self, f, senha):
+        from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+        self.f = f
+        cab = f.read(_CAB_CIFRA.size)
+        if len(cab) != _CAB_CIFRA.size or cab[:8] != MAGICA_CIFRA:
+            raise ValueError("Arquivo cifrado inválido.")
+        _, versao, log_n, r, p, sal, self.prefixo = _CAB_CIFRA.unpack(cab)
+        if versao != 1 or not (14 <= log_n <= 20) or not (1 <= r <= 16) or not (1 <= p <= 4):
+            raise ValueError("Arquivo cifrado em formato desconhecido (atualize o programa).")
+        self.cab = cab
+        self.aes = AESGCM(_chave_arquivo(senha or "", sal, log_n, r, p))
+        self.cont = 0
+
+    def proximo(self):
+        """(tipo, dados) do proximo registro, ou None no fim do arquivo."""
+        from cryptography.exceptions import InvalidTag
+        t = self.f.read(5)
+        if not t:
+            return None
+        if len(t) != 5:
+            raise ValueError("Arquivo cifrado incompleto ou danificado.")
+        tipo, tam = t[0], int.from_bytes(t[1:], "big")
+        if tipo > 2 or tam > _BLOCO_CIFRA + 16:
+            raise ValueError("Arquivo cifrado danificado.")
+        ct = self.f.read(tam)
+        if len(ct) != tam:
+            raise ValueError("Arquivo cifrado incompleto ou danificado.")
+        try:
+            dados = self.aes.decrypt(self.prefixo + self.cont.to_bytes(4, "big") + bytes([tipo]), ct, self.cab)
+        except InvalidTag:
+            if self.cont == 0:
+                raise ValueError("Senha incorreta.")
+            raise ValueError("Arquivo cifrado danificado ou alterado.")
+        self.cont += 1
+        return tipo, dados
+
+    def meta(self):
+        r = self.proximo()
+        if not r or r[0] != 0:
+            raise ValueError("Arquivo cifrado danificado.")
+        try:
+            return json.loads(r[1].decode("utf-8"))
+        except Exception:
+            raise ValueError("Arquivo cifrado danificado.")
+
+
+def ler_meta_cifrada(fonte, senha):
+    """Confere a senha e devolve os metadados, sem decifrar o restante. fonte: caminho ou arquivo."""
+    if hasattr(fonte, "read"):
+        return _LeitorCifrado(fonte, senha).meta()
+    with open(fonte, "rb") as f:
+        return _LeitorCifrado(f, senha).meta()
+
+
+def decifrar_arquivo(fonte, destino, senha):
+    """Decifra para `destino` (removido se algo falhar). Devolve os metadados."""
+    def processar(f):
+        leitor = _LeitorCifrado(f, senha)
+        meta = leitor.meta()
+        terminou = False
+        with open(destino, "wb") as out:
+            while True:
+                reg = leitor.proximo()
+                if reg is None:
+                    break
+                if terminou or reg[0] == 0:
+                    raise ValueError("Arquivo cifrado danificado.")
+                out.write(reg[1])
+                terminou = reg[0] == 2
+        if not terminou:
+            raise ValueError("Arquivo cifrado incompleto (o download ou a cópia pode ter sido interrompido).")
+        return meta
+    try:
+        if hasattr(fonte, "read"):
+            return processar(fonte)
+        with open(fonte, "rb") as f:
+            return processar(f)
+    except Exception:
+        try:
+            Path(destino).unlink()
+        except OSError:
+            pass
+        raise
+
+
+def pasta_temporaria() -> Path:
+    """Arquivos temporarios do programa (dentro da pasta de dados do usuario, nunca no OneDrive)."""
+    p = pasta_dados_app() / "tmp"
+    p.mkdir(exist_ok=True)
+    return p
+
+
+def _tmp(nome):
+    return pasta_temporaria() / f"{nome}-{os.getpid()}-{secrets.token_hex(4)}"
+
+
+def limpar_temporarios():
+    """Apaga temporarios esquecidos (ex.: programa fechado no meio de uma importacao)."""
+    try:
+        for f in pasta_temporaria().iterdir():
+            try:
+                f.unlink()
+            except OSError:
+                pass
+    except OSError:
+        pass
+
+
+# --------------------------------------------------------------------------
+# Protecao de dados pessoais (LGPD): pastas e arquivos protegidos
+# --------------------------------------------------------------------------
+#
+# Regras guardadas DENTRO do indice (tabela meta), para valerem tambem no computador do
+# cliente quando o indice viaja num pacote. Cada regra: {"termo": "ASO", "modo": ...}
+#   "so_nome": o arquivo aparece na busca so pelo nome; o conteudo nao e lido
+#   "ignorar": o arquivo nao entra no indice
+# O termo casa com uma palavra (ou sequencia de palavras) inteira do caminho relativo:
+# "ASO" casa com "ASO", "01-ASO", "ASO_Joao.pdf", mas nao com "CASO".
+
+MODO_SO_NOME = "so_nome"
+MODO_IGNORAR = "ignorar"
+MODOS_PROTECAO = {MODO_SO_NOME: "Só o nome (conteúdo não é lido)",
+                  MODO_IGNORAR: "Ignorar (não entra no índice)"}
+SUGESTOES_PROTECAO = ["ASO", "Atestado", "Exame", "Exames", "Prontuário", "Laudo médico", "Saúde",
+                      "Documentos pessoais", "RG", "CPF", "CNH", "Holerite", "Contracheque"]
+STATUS_PROTEGIDO = "protegido (só nome)"
+MAX_REGRAS = 200
+
+
+def _normalizar_palavras(t):
+    t = unicodedata.normalize("NFKD", str(t or ""))
+    t = "".join(c for c in t if not unicodedata.combining(c)).lower()
+    return " ".join(re.findall(r"[a-z0-9]+", t))
+
+
+def validar_regras(regras):
+    """Limpa e valida a lista de regras. Devolve a lista normalizada (sem duplicatas)."""
+    saida, vistos = [], {}
+    for r in regras or []:
+        if not isinstance(r, dict):
+            continue
+        termo = str(r.get("termo") or "").strip()[:60]
+        modo = r.get("modo")
+        if modo not in MODOS_PROTECAO:
+            raise ValueError(f"Modo de proteção inválido: {modo!r}")
+        chave = _normalizar_palavras(termo)
+        if len(chave) < 2:
+            raise ValueError(f"Termo de proteção curto demais: {termo!r} (mínimo 2 letras ou números).")
+        if chave in vistos:                       # repetido: "ignorar" vence "so_nome"
+            if modo == MODO_IGNORAR:
+                saida[vistos[chave]]["modo"] = MODO_IGNORAR
+            continue
+        vistos[chave] = len(saida)
+        saida.append({"termo": termo, "modo": modo})
+    if len(saida) > MAX_REGRAS:
+        raise ValueError(f"Máximo de {MAX_REGRAS} regras de proteção.")
+    return saida
+
+
+class Protecao:
+    """Aplica as regras a caminhos relativos (pastas + nome do arquivo)."""
+
+    def __init__(self, regras):
+        self.regras = validar_regras(regras)
+        self._chaves = [(" " + _normalizar_palavras(r["termo"]) + " ", r["modo"]) for r in self.regras]
+
+    def __bool__(self):
+        return bool(self._chaves)
+
+    def modo(self, caminho_relativo):
+        if not self._chaves:
+            return None
+        alvo = " " + _normalizar_palavras(caminho_relativo) + " "
+        achou = None
+        for chave, modo in self._chaves:
+            if chave in alvo:
+                if modo == MODO_IGNORAR:
+                    return MODO_IGNORAR
+                achou = MODO_SO_NOME
+        return achou
+
+
+def _juntar_regras(a, b):
+    return validar_regras(list(a or []) + list(b or []))
+
+
+# --------------------------------------------------------------------------
 # Indice
 # --------------------------------------------------------------------------
 
@@ -629,6 +908,55 @@ class Indice:
 
     def fechar(self):
         self.con.close()
+
+    # ---- protecao de dados pessoais ---------------------------------------
+
+    def regras_protecao(self):
+        r = self.con.execute("SELECT valor FROM meta WHERE chave='protecao'").fetchone()
+        try:
+            return validar_regras(json.loads(r[0])) if r and r[0] else []
+        except (ValueError, TypeError):
+            log.warning("Regras de proteção inválidas no índice; ignoradas")
+            return []
+
+    def _rel(self, caminho):
+        return caminho[len(self.raiz):].lstrip("\\/") if caminho.startswith(self.raiz) else caminho
+
+    def definir_regras_protecao(self, regras):
+        """Grava as regras e ja as aplica ao que esta indexado (sem precisar reindexar).
+        Devolve (removidos, so_nome): quantos arquivos sairam do indice / ficaram so com o nome."""
+        regras = validar_regras(regras)
+        with self.con:
+            self.con.execute("INSERT OR REPLACE INTO meta VALUES ('protecao', ?)",
+                             (json.dumps(regras, ensure_ascii=False),))
+        return self.aplicar_protecao()
+
+    def aplicar_protecao(self):
+        prot = Protecao(self.regras_protecao())
+        removidos = so_nome = 0
+        if not prot:
+            return 0, 0
+        with self.con:
+            for caminho, status in self.con.execute("SELECT caminho, status FROM arquivos").fetchall():
+                modo = prot.modo(self._rel(caminho))
+                if modo == MODO_IGNORAR:
+                    self._remover(caminho)
+                    removidos += 1
+                elif modo == MODO_SO_NOME and status != STATUS_PROTEGIDO:
+                    self.con.execute("DELETE FROM conteudo WHERE caminho = ?", (caminho,))
+                    self.con.execute("INSERT INTO conteudo (caminho, interno, nome, texto) VALUES (?,?,?,?)",
+                                     (caminho, "", _nome_pesquisavel(caminho, self.raiz), ""))
+                    self.con.execute("UPDATE arquivos SET status = ? WHERE caminho = ?", (STATUS_PROTEGIDO, caminho))
+                    so_nome += 1
+            # documentos dentro de .zip cujo nome interno e protegido
+            for rowid, caminho, interno in self.con.execute(
+                    "SELECT rowid, caminho, interno FROM conteudo WHERE interno <> ''").fetchall():
+                modo = prot.modo(interno)
+                if modo == MODO_IGNORAR:
+                    self.con.execute("DELETE FROM conteudo WHERE rowid = ?", (rowid,))
+                elif modo == MODO_SO_NOME:
+                    self.con.execute("UPDATE conteudo SET texto = '' WHERE rowid = ?", (rowid,))
+        return removidos, so_nome
 
     def empresas(self):
         return listar_empresas(self.raiz)
@@ -699,13 +1027,31 @@ class Indice:
             return {"total": len(no_disco), "lidos": 0, "removidos": 0, "erros": 0,
                     "liberados": 0, "falhas": falhas, "cancelado": True}
 
+        # protecao LGPD: arquivos "ignorar" saem da lista (e do indice, mesmo com pastas inacessiveis)
+        prot = Protecao(self.regras_protecao())
+        modos = {}
+        if prot:
+            for p in list(no_disco):
+                m = prot.modo(self._rel(p))
+                if m == MODO_IGNORAR:
+                    del no_disco[p]
+                elif m:
+                    modos[p] = m
+            for (p,) in self.con.execute("SELECT caminho FROM arquivos").fetchall():
+                if prot.modo(self._rel(p)) == MODO_IGNORAR:
+                    self._remover(p)
+            self.con.commit()
+
         no_indice = {r[0]: (r[1], r[2]) for r in
                      self.con.execute("SELECT caminho, mtime, tamanho FROM arquivos")}
+        status_ant = dict(self.con.execute("SELECT caminho, status FROM arquivos").fetchall())
 
         # Se alguma pasta nao pode ser lida (rede/VPN instavel), nao remove nada:
         # um arquivo "sumido" pode estar apenas inacessivel naquele momento.
         removidos = [] if falhas else [p for p in no_indice if p not in no_disco]
-        novos = [p for p, mt in no_disco.items() if _mudou(no_indice.get(p), mt)]
+        novos = [p for p, mt in no_disco.items() if _mudou(no_indice.get(p), mt)
+                 # mudou a regra: protegido -> normal (reler) ou normal -> protegido (tirar o conteudo)
+                 or (status_ant.get(p) == STATUS_PROTEGIDO) != (modos.get(p) == MODO_SO_NOME)]
         if tentar_erros:
             ja = set(novos)
             novos += [p for (p,) in self.con.execute("SELECT caminho FROM arquivos WHERE status LIKE 'erro%'")
@@ -728,7 +1074,11 @@ class Indice:
             leu_conteudo = (tam <= MAX_TAMANHO_MB * 1024 * 1024
                             and os.path.splitext(nome)[1].lower() in EXT_CONTEUDO)
             try:
-                if tam > MAX_TAMANHO_MB * 1024 * 1024:
+                if modos.get(p) == MODO_SO_NOME:
+                    partes = [("", "")]                     # protegido: nem abre o arquivo
+                    status = STATUS_PROTEGIDO
+                    leu_conteudo = False
+                elif tam > MAX_TAMANHO_MB * 1024 * 1024:
                     partes = [("", "")]
                     status = "grande"
                 else:
@@ -744,6 +1094,12 @@ class Indice:
             self._remover(p)
             nome_busca = _nome_pesquisavel(p, self.raiz)
             for interno, texto in partes:
+                if interno and prot:                        # documento dentro de .zip
+                    m = prot.modo(interno)
+                    if m == MODO_IGNORAR:
+                        continue
+                    if m == MODO_SO_NOME:
+                        texto = ""
                 self.con.execute(
                     "INSERT INTO conteudo (caminho, interno, nome, texto) VALUES (?,?,?,?)",
                     (p, interno, nome_busca, texto))
@@ -925,11 +1281,27 @@ class Indice:
             raise ValueError("Escolha ao menos uma empresa para exportar.")
         return "(" + " OR ".join(conds) + ")", params
 
-    def exportar(self, destino, pastas=None, incluir_fora=True):
+    def exportar(self, destino, pastas=None, incluir_fora=True, senha=None):
         """
-        Gera um arquivo .bdx (SQLite) com o indice inteiro ou so das empresas escolhidas.
-        Devolve quantos arquivos foram exportados.
+        Gera um arquivo .bdx com o indice inteiro ou so das empresas escolhidas, CIFRADO com a
+        senha (obrigatoria: o indice contem o texto dos documentos). Devolve quantos arquivos.
         """
+        checar_senha_arquivo(senha)
+        plano = _tmp("exportando") 
+        try:
+            n = self._exportar_plano(plano, pastas, incluir_fora)
+            cifrar_arquivo(plano, destino, senha, {"formato": FORMATO_EXPORTACAO, "raiz": self.raiz,
+                                                   "arquivos": n, "exportado_em": time.strftime("%d/%m/%Y %H:%M")})
+        finally:
+            try:
+                plano.unlink()
+            except OSError:
+                pass
+        log.info("Índice exportado (cifrado): %s (%d arquivos)", destino, n)
+        return n
+
+    def _exportar_plano(self, destino, pastas=None, incluir_fora=True):
+        """Gera o .bdx SEM cifra, so para uso interno (sempre numa pasta temporaria do programa)."""
         destino = Path(destino)
         tmp = destino.with_name(destino.name + ".tmp")
         if tmp.exists():
@@ -949,6 +1321,7 @@ class Indice:
                 ("formato", FORMATO_EXPORTACAO),
                 ("exportado_em", time.strftime("%d/%m/%Y %H:%M")),
                 ("atualizado", r[0][0] if r else ""),
+                ("protecao", json.dumps(self.regras_protecao(), ensure_ascii=False)),
             ])
             con.commit()
             n = con.execute("SELECT COUNT(*) FROM arquivos").fetchall()[0][0]
@@ -959,7 +1332,6 @@ class Indice:
             raise
         con.close()
         os.replace(tmp, destino)
-        log.info("Índice exportado: %s (%d arquivos)", destino, n)
         return n
 
     def mesclar(self, arquivo):
@@ -977,14 +1349,27 @@ class Indice:
                 r = self.con.execute("SELECT valor FROM imp.meta WHERE chave='atualizado'").fetchall()
                 if r and r[0][0]:
                     self.con.execute("INSERT OR REPLACE INTO meta VALUES ('atualizado', ?)", (r[0][0],))
+                r = self.con.execute("SELECT valor FROM imp.meta WHERE chave='protecao'").fetchall()
+                vindas = json.loads(r[0][0]) if r and r[0][0] else []
             n = self.con.execute("SELECT COUNT(*) FROM imp.arquivos").fetchall()[0][0]
         finally:
             self.con.execute("DETACH DATABASE imp")
+        if vindas:   # regras de protecao viajam com o indice e passam a valer aqui tambem
+            self.definir_regras_protecao(_juntar_regras(self.regras_protecao(), vindas))
         return n
 
 
-def ler_exportacao(arquivo):
-    """Le e valida o cabecalho de um indice exportado. Devolve dict(raiz, arquivos, exportado_em)."""
+def ler_exportacao(arquivo, senha=None):
+    """Le e valida o cabecalho de um indice exportado. Devolve dict(raiz, arquivos, exportado_em, cifrado).
+    Arquivo cifrado: confere a senha lendo so os metadados (rapido)."""
+    if esta_cifrado(arquivo):
+        if not senha:
+            raise ValueError("Este índice é protegido por senha.")
+        m = ler_meta_cifrada(arquivo, senha)
+        if m.get("formato") != FORMATO_EXPORTACAO:
+            raise ValueError("Este arquivo não é um índice exportado pelo Busca Databook.")
+        return {"raiz": str(m.get("raiz") or ""), "arquivos": int(m.get("arquivos") or 0),
+                "exportado_em": str(m.get("exportado_em") or ""), "cifrado": True}
     try:
         con = sqlite3.connect(str(arquivo))
     except sqlite3.Error as e:
@@ -999,19 +1384,25 @@ def ler_exportacao(arquivo):
         raise ValueError(f"Arquivo de índice inválido ou corrompido: {e}")
     finally:
         con.close()
-    return {"raiz": meta.get("raiz", ""), "arquivos": n, "exportado_em": meta.get("exportado_em", "")}
+    return {"raiz": meta.get("raiz", ""), "arquivos": n, "exportado_em": meta.get("exportado_em", ""),
+            "cifrado": False}
 
 
-def importar_indice(arquivo, nova_raiz):
+def importar_indice(arquivo, nova_raiz, senha=None):
     """
     Importa um .bdx para a pasta principal nova_raiz (pode ser outro caminho que o de origem:
     os caminhos sao ajustados). Junta ao indice existente dessa pasta. Devolve quantos arquivos.
+    Indices cifrados sao decifrados numa pasta temporaria do programa (apagada no fim).
     """
-    info = ler_exportacao(arquivo)
-    idx = Indice(nova_raiz)
-    tmp = pasta_dados_app() / "indices" / f"importando-{os.getpid()}-{int(time.time())}.db"
+    tmp = _tmp("importando")
+    idx = None
     try:
-        shutil.copyfile(arquivo, tmp)   # trabalha numa copia: o arquivo recebido fica intacto
+        if esta_cifrado(arquivo):
+            decifrar_arquivo(arquivo, tmp, senha)
+        else:
+            shutil.copyfile(arquivo, tmp)   # trabalha numa copia: o arquivo recebido fica intacto
+        info = ler_exportacao(tmp)
+        idx = Indice(nova_raiz)
         con = sqlite3.connect(str(tmp))
         try:
             if con.execute("PRAGMA quick_check").fetchone()[0] != "ok":
@@ -1035,11 +1426,13 @@ def importar_indice(arquivo, nova_raiz):
         log.info("Índice importado de %s para %s (%d arquivos)", arquivo, idx.raiz, n)
         return n
     finally:
-        idx.fechar()
-        try:
-            tmp.unlink()
-        except OSError:
-            pass
+        if idx:
+            idx.fechar()
+        for f in (tmp, Path(str(tmp) + "-journal")):
+            try:
+                f.unlink()
+            except OSError:
+                pass
 
 
 # --------------------------------------------------------------------------
@@ -1047,9 +1440,10 @@ def importar_indice(arquivo, nova_raiz):
 # --------------------------------------------------------------------------
 #
 # Um .bdpack e um zip com no maximo 3 itens:
-#   manifest.json  - nome do cliente, cor do menu, pasta de origem, resumo do indice
-#   logo.png       - logomarca do cliente (opcional)
-#   indice.bdx     - indice exportado (opcional)
+#   manifest.json        - nome do cliente, cor do menu, pasta de origem, resumo do indice
+#   logo.png             - logomarca do cliente (opcional)
+#   indice.bdx.cifrado   - indice exportado e CIFRADO com senha (opcional; desde a 3.6)
+#   indice.bdx           - indice sem cifra (so pacotes antigos, 3.3 a 3.5: ainda aceitos)
 # Nada e extraido para caminhos vindos do arquivo: so esses nomes fixos sao lidos.
 
 RE_COR = re.compile(r"^#[0-9A-Fa-f]{6}$")
@@ -1097,11 +1491,15 @@ def _validar_manifest(m):
             "criado_em": str(m.get("criado_em") or "")}
 
 
-def criar_pacote(destino, cliente, cor_menu=None, logo_bytes=None, indice=None, pastas=None, incluir_fora=True):
+def criar_pacote(destino, cliente, cor_menu=None, logo_bytes=None, indice=None, pastas=None, incluir_fora=True,
+                 senha=None):
     """
     Gera o .bdpack. indice: um Indice aberto (ou None para pacote so com a identidade visual);
     pastas/incluir_fora: quais empresas exportar (mesma regra de Indice.exportar).
+    Com indice, a senha e obrigatoria: o indice vai cifrado dentro do pacote.
     """
+    if indice is not None:
+        checar_senha_arquivo(senha)
     cliente = (cliente or "").strip()
     if not cliente:
         raise ValueError("Informe o nome do cliente.")
@@ -1111,25 +1509,31 @@ def criar_pacote(destino, cliente, cor_menu=None, logo_bytes=None, indice=None, 
     manifest = {"formato": FORMATO_PACOTE, "cliente": cliente, "cor_menu": cor_menu or None,
                 "criado_em": time.strftime("%d/%m/%Y %H:%M"), "pasta_origem": "", "indice": None}
     destino = Path(destino)
-    tmp_bdx = None
+    tmp_bdx = tmp_cif = None
     try:
         if indice is not None:
-            (pasta_dados_app() / "indices").mkdir(exist_ok=True)
-            tmp_bdx = pasta_dados_app() / "indices" / f"pacote-{os.getpid()}-{int(time.time())}.bdx"
-            n = indice.exportar(tmp_bdx, pastas, incluir_fora)
+            tmp_bdx, tmp_cif = _tmp("pacote"), _tmp("pacote-cifrado")
+            n = indice._exportar_plano(tmp_bdx, pastas, incluir_fora)
+            cifrar_arquivo(tmp_bdx, tmp_cif, senha, {"formato": FORMATO_EXPORTACAO, "raiz": indice.raiz,
+                                                     "arquivos": n, "exportado_em": time.strftime("%d/%m/%Y %H:%M")})
             manifest["pasta_origem"] = indice.raiz
-            manifest["indice"] = {"arquivos": n, "atualizado": (indice.info()[1] or "")}
+            manifest["indice"] = {"arquivos": n, "atualizado": (indice.info()[1] or ""), "cifrado": True,
+                                  "protecao": len(indice.regras_protecao())}
         parcial = destino.with_name(destino.name + ".tmp")
         with zipfile.ZipFile(parcial, "w", zipfile.ZIP_DEFLATED) as z:
             z.writestr("manifest.json", json.dumps(manifest, ensure_ascii=False, indent=2))
             if logo:
                 z.writestr("logo.png", logo)
-            if tmp_bdx:
-                z.write(tmp_bdx, "indice.bdx")
+            if tmp_cif:
+                z.write(tmp_cif, "indice.bdx.cifrado", compress_type=zipfile.ZIP_STORED)
         os.replace(parcial, destino)
     finally:
-        if tmp_bdx and tmp_bdx.exists():
-            tmp_bdx.unlink()
+        for f in (tmp_bdx, tmp_cif):
+            if f:
+                try:
+                    f.unlink()
+                except OSError:
+                    pass
     log.info("Pacote do cliente criado: %s (%s)", destino, cliente)
     return manifest
 
@@ -1142,7 +1546,8 @@ def ler_pacote(arquivo):
         raise ValueError(f"Não foi possível abrir o pacote: {e}")
     with z:
         nomes = {i.filename: i for i in z.infolist()}
-        if set(nomes) - {"manifest.json", "logo.png", "indice.bdx"} or "manifest.json" not in nomes:
+        if (set(nomes) - {"manifest.json", "logo.png", "indice.bdx", "indice.bdx.cifrado"}
+                or "manifest.json" not in nomes or {"indice.bdx", "indice.bdx.cifrado"} <= set(nomes)):
             raise ValueError("Pacote com conteúdo inesperado. Por segurança, ele não será usado.")
         if nomes["manifest.json"].file_size > MAX_MANIFEST_BYTES:
             raise ValueError("Pacote inválido (manifesto grande demais).")
@@ -1154,8 +1559,21 @@ def ler_pacote(arquivo):
             raise ValueError("Pacote inválido (manifesto ilegível).")
         info = _validar_manifest(m)
         info["tem_logo"] = "logo.png" in nomes
-        info["tem_indice"] = "indice.bdx" in nomes
+        info["indice_cifrado"] = "indice.bdx.cifrado" in nomes
+        info["tem_indice"] = info["indice_cifrado"] or "indice.bdx" in nomes
         return info
+
+
+def conferir_senha_pacote(arquivo, senha):
+    """True se a senha abre o indice do pacote (le so os metadados cifrados: rapido)."""
+    with zipfile.ZipFile(arquivo) as z, z.open("indice.bdx.cifrado") as f:
+        try:
+            ler_meta_cifrada(f, senha)
+            return True
+        except ValueError as e:
+            if str(e) == "Senha incorreta.":
+                return False
+            raise
 
 
 def aplicar_marca(cliente, cor_menu=None, logo_png=None):
@@ -1197,32 +1615,75 @@ def remover_marca():
             pass
 
 
-def importar_pacote(arquivo, nova_raiz=None):
+def importar_pacote(arquivo, nova_raiz=None, senha=None):
     """
     Aplica o pacote: identidade visual e, se houver indice, importa-o para nova_raiz.
+    Indice cifrado: decifra ANTES de aplicar qualquer coisa (senha errada nao muda nada).
     Devolve (info do pacote, arquivos importados).
     """
     info = ler_pacote(arquivo)
     n = 0
     tmp = None
-    with zipfile.ZipFile(arquivo) as z:
-        logo = z.read("logo.png") if info["tem_logo"] else None
-        if info["tem_indice"]:
-            if not nova_raiz:
-                raise ValueError("Escolha a pasta principal para importar o índice.")
-            (pasta_dados_app() / "indices").mkdir(exist_ok=True)      # PC recem-instalado
-            tmp = pasta_dados_app() / "indices" / f"pacote-imp-{os.getpid()}-{int(time.time())}.bdx"
-            with z.open("indice.bdx") as src, open(tmp, "wb") as dst:
-                shutil.copyfileobj(src, dst, 1 << 20)
     try:
+        with zipfile.ZipFile(arquivo) as z:
+            logo = z.read("logo.png") if info["tem_logo"] else None
+            if info["tem_indice"]:
+                if not nova_raiz:
+                    raise ValueError("Escolha a pasta principal para importar o índice.")
+                tmp = _tmp("pacote-imp")
+                if info["indice_cifrado"]:
+                    with z.open("indice.bdx.cifrado") as src:
+                        decifrar_arquivo(src, tmp, senha)
+                else:                                       # pacote antigo (3.3 a 3.5)
+                    with z.open("indice.bdx") as src, open(tmp, "wb") as dst:
+                        shutil.copyfileobj(src, dst, 1 << 20)
         aplicar_marca(info["cliente"], info["cor_menu"], logo)
         if tmp:
             n = importar_indice(tmp, nova_raiz)
     finally:
-        if tmp and tmp.exists():
-            tmp.unlink()
+        if tmp:
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
     log.info("Pacote do cliente aplicado: %s (%d arquivos)", info["cliente"], n)
     return info, n
+
+
+# --------------------------------------------------------------------------
+# Eliminacao de dados (LGPD, arts. 15 e 16)
+# --------------------------------------------------------------------------
+
+def apagar_indice(pasta_raiz):
+    """Apaga o indice de uma pasta principal (o banco e seus arquivos auxiliares).
+    Os documentos originais nao sao tocados. O indice precisa estar fechado."""
+    base = caminho_indice(os.path.abspath(pasta_raiz))
+    apagados = 0
+    for f in (base, Path(str(base) + "-wal"), Path(str(base) + "-shm"), Path(str(base) + "-journal")):
+        if f.exists():
+            f.unlink()
+            apagados += 1
+    return apagados > 0
+
+
+def apagar_todos_os_dados():
+    """Apaga TUDO o que o programa guarda neste usuario do Windows: indices, usuarios, configuracao,
+    personalizacao, registros, temporarios e atualizacoes baixadas. Os documentos nao sao tocados.
+    Antes de chamar, feche os indices e os arquivos de log. Devolve a lista do que nao foi apagado."""
+    falhas = []
+    raiz = pasta_dados_app()
+
+    def erro(func, caminho, exc):
+        falhas.append(str(caminho))
+    for item in raiz.iterdir():
+        try:
+            if item.is_dir():
+                shutil.rmtree(item, onerror=erro)
+            else:
+                item.unlink()
+        except OSError:
+            falhas.append(str(item))
+    return falhas
 
 
 # --------------------------------------------------------------------------
@@ -1379,7 +1840,8 @@ class Usuarios:
     Usuarios locais deste computador. Senhas e codigos de recuperacao sao guardados so
     como hash PBKDF2 (com sal): nem o programa nem o administrador conseguem le-los.
     """
-    ITERACOES = 200_000
+    ITERACOES = 600_000          # OWASP (PBKDF2-HMAC-SHA256); hashes antigos (200 mil) sao refeitos no login
+    ITERACOES_ANTIGAS = 200_000
 
     def __init__(self):
         self.con = sqlite3.connect(str(pasta_dados_app() / "usuarios.db"))
@@ -1387,14 +1849,16 @@ class Usuarios:
             login TEXT PRIMARY KEY, sal BLOB, hash BLOB, admin INTEGER)""")
         # colunas novas (3.2): senha provisoria e codigo de recuperacao
         cols = {r[1] for r in self.con.execute("PRAGMA table_info(usuarios)")}
-        for nome, tipo in (("provisoria", "INTEGER DEFAULT 0"), ("rec_sal", "BLOB"), ("rec_hash", "BLOB")):
+        for nome, tipo in (("provisoria", "INTEGER DEFAULT 0"), ("rec_sal", "BLOB"), ("rec_hash", "BLOB"),
+                           ("iter", f"INTEGER DEFAULT {self.ITERACOES_ANTIGAS}"),
+                           ("rec_iter", f"INTEGER DEFAULT {self.ITERACOES_ANTIGAS}")):
             if nome not in cols:
                 self.con.execute(f"ALTER TABLE usuarios ADD COLUMN {nome} {tipo}")
         self.con.commit()
 
     @classmethod
-    def _hash(cls, senha, sal):
-        return hashlib.pbkdf2_hmac("sha256", senha.encode("utf-8"), sal, cls.ITERACOES)
+    def _hash(cls, senha, sal, iteracoes=None):
+        return hashlib.pbkdf2_hmac("sha256", senha.encode("utf-8"), sal, iteracoes or cls.ITERACOES)
 
     @staticmethod
     def _checar_senha(senha, login=""):
@@ -1422,18 +1886,23 @@ class Usuarios:
         if self.con.execute("SELECT 1 FROM usuarios WHERE login=?", (login,)).fetchone():
             raise ValueError("Já existe um usuário com esse nome.")
         sal = os.urandom(16)
-        self.con.execute("INSERT INTO usuarios (login, sal, hash, admin, provisoria) VALUES (?,?,?,?,?)",
-                         (login, sal, self._hash(senha, sal), int(admin), int(provisoria)))
+        self.con.execute("INSERT INTO usuarios (login, sal, hash, admin, provisoria, iter) VALUES (?,?,?,?,?,?)",
+                         (login, sal, self._hash(senha, sal), int(admin), int(provisoria), self.ITERACOES))
         self.con.commit()
         return senha if provisoria else None
 
     def validar(self, login, senha):
         """Devolve {login, admin, provisoria, tem_codigo} se a senha estiver certa; senao None."""
         login = login.strip().lower()
-        r = self.con.execute("SELECT sal, hash, admin, provisoria, rec_hash FROM usuarios WHERE login=?",
+        r = self.con.execute("SELECT sal, hash, admin, provisoria, rec_hash, iter FROM usuarios WHERE login=?",
                              (login,)).fetchone()
         if r:
-            if hmac.compare_digest(self._hash(senha, r[0]), r[1]):
+            if hmac.compare_digest(self._hash(senha, r[0], r[5]), r[1]):
+                if (r[5] or 0) < self.ITERACOES:          # hash antigo: refaz com o custo atual
+                    sal = os.urandom(16)
+                    self.con.execute("UPDATE usuarios SET sal=?, hash=?, iter=? WHERE login=?",
+                                     (sal, self._hash(senha, sal), self.ITERACOES, login))
+                    self.con.commit()
                 return {"login": login, "admin": bool(r[2]), "provisoria": bool(r[3]), "tem_codigo": bool(r[4])}
         else:
             # mesmo custo de tempo para usuario inexistente (nao revela quais logins existem)
@@ -1449,12 +1918,15 @@ class Usuarios:
         self.con.execute("DELETE FROM usuarios WHERE login=?", (login,))
         self.con.commit()
 
+    def fechar(self):
+        self.con.close()
+
     def trocar_senha(self, login, nova, provisoria=False):
         if not provisoria:                         # provisoria: gerada pelo programa (redefinir)
             self._checar_senha(nova, login)
         sal = os.urandom(16)
-        self.con.execute("UPDATE usuarios SET sal=?, hash=?, provisoria=? WHERE login=?",
-                         (sal, self._hash(nova, sal), int(provisoria), login))
+        self.con.execute("UPDATE usuarios SET sal=?, hash=?, provisoria=?, iter=? WHERE login=?",
+                         (sal, self._hash(nova, sal), int(provisoria), self.ITERACOES, login))
         self.con.commit()
 
     def redefinir(self, login):
@@ -1469,8 +1941,8 @@ class Usuarios:
         """Cria um codigo de recuperacao novo (o anterior deixa de valer). Exibir uma unica vez."""
         bruto = self._aleatorio(TAM_CODIGO)
         sal = os.urandom(16)
-        self.con.execute("UPDATE usuarios SET rec_sal=?, rec_hash=? WHERE login=?",
-                         (sal, self._hash(bruto, sal), login))
+        self.con.execute("UPDATE usuarios SET rec_sal=?, rec_hash=?, rec_iter=? WHERE login=?",
+                         (sal, self._hash(bruto, sal), self.ITERACOES, login))
         self.con.commit()
         return "-".join(bruto[i:i + 4] for i in range(0, TAM_CODIGO, 4))
 
@@ -1482,11 +1954,11 @@ class Usuarios:
         login = login.strip().lower()
         self._checar_senha(nova, login)
         cod = _normalizar_codigo(codigo)
-        r = self.con.execute("SELECT rec_sal, rec_hash FROM usuarios WHERE login=?", (login,)).fetchone()
+        r = self.con.execute("SELECT rec_sal, rec_hash, rec_iter FROM usuarios WHERE login=?", (login,)).fetchone()
         if not r or not r[0] or not r[1]:
             self._hash(cod, b"\0" * 16)          # mesmo custo de tempo: nao revela se o usuario existe
             return None
-        if len(cod) != TAM_CODIGO or not hmac.compare_digest(self._hash(cod, r[0]), r[1]):
+        if len(cod) != TAM_CODIGO or not hmac.compare_digest(self._hash(cod, r[0], r[2]), r[1]):
             return None
         self.trocar_senha(login, nova, provisoria=False)
         return self.gerar_codigo(login)

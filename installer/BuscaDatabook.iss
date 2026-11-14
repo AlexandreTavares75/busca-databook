@@ -79,8 +79,10 @@ Filename: "{app}\{#AppExe}"; Description: "Abrir o {#AppName}"; Flags: nowait po
 ; Atualizacao automatica (/SILENT /RELAUNCH): reabre o programa sozinho
 Filename: "{app}\{#AppExe}"; Flags: nowait; Check: DeveReabrir
 
-; Os dados do usuario (indices, usuarios.db, config, erro.log) ficam em
-; %LOCALAPPDATA%\BuscaDatabook e NAO sao apagados na desinstalacao.
+; Os dados do usuario (indices, usuarios.db, config, logs) ficam em
+; %LOCALAPPDATA%\BuscaDatabook. Na desinstalacao feita pelo usuario (Painel de Controle), o
+; desinstalador PERGUNTA se deve apaga-los (padrao: Nao). Atualizacoes nunca apagam dados:
+; o instalador novo e executado por cima, sem desinstalar.
 
 [Code]
 const
@@ -130,4 +132,23 @@ end;
 function DeveReabrir(): Boolean;
 begin
   Result := WizardSilent() and (Pos('/RELAUNCH', Uppercase(GetCmdTail())) > 0);
+end;
+
+{ LGPD (eliminacao): oferece apagar os dados do programa ao desinstalar. Nunca em modo silencioso. }
+procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
+var
+  Pasta: String;
+begin
+  if (CurUninstallStep = usPostUninstall) and (not UninstallSilent()) then
+  begin
+    Pasta := ExpandConstant('{localappdata}\BuscaDatabook');
+    if DirExists(Pasta) then
+      if MsgBox('Apagar também os dados do Busca Databook deste usuário do Windows?' + #13#10 + #13#10 +
+                'Índices (com o texto dos documentos), usuários e senhas, configurações e registros em:' + #13#10 +
+                Pasta + #13#10 + #13#10 +
+                'Os documentos originais NÃO são apagados.' + #13#10 +
+                'Escolha Não se for reinstalar o programa.',
+                mbConfirmation, MB_YESNO or MB_DEFBUTTON2) = IDYES then
+        DelTree(Pasta, True, True, True);
+  end;
 end;

@@ -788,14 +788,18 @@ def limpar_temporarios():
 #
 # Regras guardadas DENTRO do indice (tabela meta), para valerem tambem no computador do
 # cliente quando o indice viaja num pacote. Cada regra: {"termo": "ASO", "modo": ...}
+#   "restrito": o conteudo e indexado (ex.: para defesa em processos), mas so quem tem acesso a dados
+#               pessoais completos acha pelo conteudo, ve o trecho e abre o arquivo; os demais so pelo nome
 #   "so_nome": o arquivo aparece na busca so pelo nome; o conteudo nao e lido
 #   "ignorar": o arquivo nao entra no indice
 # O termo casa com uma palavra (ou sequencia de palavras) inteira do caminho relativo:
 # "ASO" casa com "ASO", "01-ASO", "ASO_Joao.pdf", mas nao com "CASO".
 
+MODO_RESTRITO = "restrito"
 MODO_SO_NOME = "so_nome"
 MODO_IGNORAR = "ignorar"
-MODOS_PROTECAO = {MODO_SO_NOME: "Só o nome (conteúdo não é lido)",
+MODOS_PROTECAO = {MODO_RESTRITO: "Restrito (conteúdo só para acesso completo)",
+                  MODO_SO_NOME: "Só o nome (conteúdo não é lido)",
                   MODO_IGNORAR: "Ignorar (não entra no índice)"}
 SUGESTOES_PROTECAO = ["ASO", "Atestado", "Exame", "Exames", "Prontuário", "Laudo médico", "Saúde",
                       "Documentos pessoais", "RG", "CPF", "CNH", "Holerite", "Contracheque"]
@@ -822,9 +826,10 @@ def validar_regras(regras):
         chave = _normalizar_palavras(termo)
         if len(chave) < 2:
             raise ValueError(f"Termo de proteção curto demais: {termo!r} (mínimo 2 letras ou números).")
-        if chave in vistos:                       # repetido: "ignorar" vence "so_nome"
-            if modo == MODO_IGNORAR:
-                saida[vistos[chave]]["modo"] = MODO_IGNORAR
+        if chave in vistos:                       # repetido: vale o modo mais forte
+            forca = {MODO_RESTRITO: 1, MODO_SO_NOME: 2, MODO_IGNORAR: 3}
+            if forca[modo] > forca[saida[vistos[chave]]["modo"]]:
+                saida[vistos[chave]]["modo"] = modo
             continue
         vistos[chave] = len(saida)
         saida.append({"termo": termo, "modo": modo})
@@ -844,20 +849,130 @@ class Protecao:
         return bool(self._chaves)
 
     def modo(self, caminho_relativo):
+        """Modo mais forte que se aplica: ignorar > so_nome > restrito > None."""
         if not self._chaves:
             return None
         alvo = " " + _normalizar_palavras(caminho_relativo) + " "
+        forca = {MODO_RESTRITO: 1, MODO_SO_NOME: 2, MODO_IGNORAR: 3}
         achou = None
         for chave, modo in self._chaves:
-            if chave in alvo:
-                if modo == MODO_IGNORAR:
-                    return MODO_IGNORAR
-                achou = MODO_SO_NOME
+            if chave in alvo and (achou is None or forca[modo] > forca[achou]):
+                achou = modo
         return achou
 
 
 def _juntar_regras(a, b):
     return validar_regras(list(a or []) + list(b or []))
+
+
+# --------------------------------------------------------------------------
+# Mascaramento de dados pessoais na tela (LGPD: necessidade)
+# --------------------------------------------------------------------------
+#
+# Quem NAO tem "acesso a dados pessoais completos" ve os trechos com mascara. O indice guarda
+# o texto completo (necessario para a defesa em processos), so a exibicao muda.
+# CPF segue o padrao do governo federal (Portal da Transparencia): ***.456.789-**.
+# Para os demais numeros nao ha padrao oficial: segue-se a mesma ideia (esconder o inicio e o
+# fim, mostrar so o miolo). Dados de saude (CID) e valores de salario sao escondidos por inteiro.
+
+_I = re.IGNORECASE
+_ROT_NUM = r"(?:\s*(?:n[º°o]\.?|n[uú]mero|:|-|–)\s*)*"          # "nº", ":", "-" entre o rotulo e o numero
+
+
+def _mascarar_meio(numero, inicio=None, fim=2):
+    """Esconde os primeiros e os ultimos digitos, mantendo pontos e tracos."""
+    digitos = [i for i, c in enumerate(numero) if c.isdigit() or c in "xX"]
+    n = len(digitos)
+    if n <= 6:
+        esconder = set(digitos)
+    else:
+        ini = inicio if inicio is not None else max(2, n // 4)
+        esconder = set(digitos[:ini] + digitos[n - fim:])
+    return "".join("*" if i in esconder else c for i, c in enumerate(numero))
+
+
+def _mask_cpf(m):
+    return f"***.{m.group(2)}.{m.group(3)}-**"
+
+
+def _mask_rotulo_numero(m):
+    return m.group(1) + _mascarar_meio(m.group(2))
+
+
+_REGRAS_MASCARA = [
+    # CPF formatado ou 11 digitos seguidos (padrao do governo)
+    (re.compile(r"(?<![\d./-])(\d{3})\.?(\d{3})\.?(\d{3})-?(\d{2})(?![\d])"), _mask_cpf),
+    # PIS/PASEP/NIT/NIS formatado: 123.45678.90-1
+    (re.compile(r"(?<![\d./-])\d{3}\.\d{5}\.\d{2}-\d(?!\d)"), lambda m: _mascarar_meio(m.group(0), 3, 3)),
+    # PIS/NIT/NIS/CTPS/RG com rotulo
+    (re.compile(r"(\b(?:PIS(?:/PASEP)?|PASEP|NIT|NIS)\b" + _ROT_NUM + r")(\d[\d.\-]{6,16}\d)", _I), _mask_rotulo_numero),
+    (re.compile(r"(\b(?:CTPS|Carteira\s+de\s+Trabalho)\b[^\d\n]{0,25}?)(\d[\d./\-]{3,18}\d)", _I), _mask_rotulo_numero),
+    (re.compile(r"(\b(?:RG|R\.G\.|Identidade|C[eé]dula\s+de\s+Identidade|Carteira\s+de\s+Identidade)\b"
+                + _ROT_NUM + r"(?:[A-Z]{2}[-\s]?)?)(\d[\d.\-]{3,14}[\dXx])", _I), _mask_rotulo_numero),
+    # RG formatado sem rotulo: 12.345.678-9 (o digito final evita confundir com valores 12.345.678,90)
+    (re.compile(r"(?<![\d./-])\d{1,2}\.\d{3}\.\d{3}-[\dXx](?![\d])"), lambda m: _mascarar_meio(m.group(0))),
+    # CID (dado de saude): esconde o codigo inteiro
+    (re.compile(r"(\bCID(?:[\s-]*10)?\b[\s:.\-–]*(?:n[º°o]\.?\s*)?)([A-TV-Z]\d{2}(?:\.\d{1,2})?"
+                r"(?:\s*[,/e]\s*[A-TV-Z]\d{2}(?:\.\d{1,2})?)*)", _I), lambda m: m.group(1) + "***"),
+    # Telefone: (85) 99999-1234 ou com rotulo -> mostra so os 4 ultimos
+    (re.compile(r"(?<!\d)(?:\+?55\s?)?\(\d{2}\)\s?9?\d{4}[-\s]?(\d{4})(?!\d)"), lambda m: f"(**) *****-{m.group(1)}"),
+    (re.compile(r"(\b(?:Tel|Telefone|Fone|Celular|Cel|WhatsApp|Contato)\b[.:\s]*)(?:\+?55\s?)?\(?\d{2}\)?[\s-]?9?\d{4}"
+                r"[-\s]?(\d{4})(?!\d)", _I), lambda m: f"{m.group(1)}(**) *****-{m.group(2)}"),
+    # Data de nascimento
+    (re.compile(r"(\b(?:data\s+de\s+nascimento|data\s+nasc\.?|nascimento|nascid[oa]\s+em|nasc\.|D\.?\s?N\.)"
+                r"\s*:?\s*(?:em\s+)?)\d{1,2}[/.\-]\d{1,2}[/.\-]\d{2,4}", _I), lambda m: m.group(1) + "**/**/****"),
+    # Endereco residencial (ate 70 caracteres depois do rotulo)
+    (re.compile(r"(\b(?:endere[cç]o(?:\s+residencial)?|residente\s+e\s+domiciliad[oa]\s+(?:na|no|em|à)|"
+                r"residente\s+(?:na|no|em|à)|domiciliad[oa]\s+(?:na|no|em|à))\s*:?\s*)([^\n;|…\[\]]{3,70})", _I),
+     lambda m: m.group(1) + "***"),
+    # Salario / remuneracao
+    (re.compile(r"(\b(?:sal[aá]rio(?:\s+(?:base|contratual|mensal|bruto|l[ií]quido))?|remunera[cç][aã]o|vencimentos|"
+                r"proventos)\b[^\d\n]{0,25}?)(?:R\$\s?)?\d{1,3}(?:\.\d{3})*(?:,\d{2})?(?!\d)", _I),
+     lambda m: m.group(1) + "R$ ***"),
+]
+# so quando o trecho foi cortado (o indice marca o corte com "…")
+_FRAGMENTO_BORDA = re.compile(r"(^\s*…\s*(?:R\$\s?)?\d[\d.,\-/]*\d|\d[\d.,\-/]*\d\s*…\s*$)")
+_NUMERO_EM_MARCA = re.compile(r"\[([^\]]*\d[^\]]*)\]")
+
+
+def mascarar(texto):
+    """Mascara CPF, PIS/NIT, RG, CTPS, CID, telefone, data de nascimento, endereco e salario."""
+    if not texto:
+        return texto
+    t = _NUMERO_EM_MARCA.sub(r"\1", texto)             # tira o destaque [ ] de dentro de numeros
+    for rx, troca in _REGRAS_MASCARA:
+        t = rx.sub(troca, t)
+    # trecho cortado no meio de um numero ("…789-09 Maria"): esconde o pedaco da borda
+    def borda(m):
+        frag = m.group(0)
+        return re.sub(r"\d", "*", frag) if sum(c.isdigit() for c in frag) >= 3 else frag
+    return _FRAGMENTO_BORDA.sub(borda, t)
+
+
+# Identificadores que tornam o DOCUMENTO restrito (abrir/baixar exige acesso completo):
+# CPF, PIS/NIT, CTPS, RG, CID e data de nascimento. Telefone, endereco e salario sao mascarados no
+# trecho, mas sozinhos nao bloqueiam: aparecem em quase todo timbrado e contrato de empresa.
+_REGRAS_FORTES = [r for i, r in enumerate(_REGRAS_MASCARA) if i in (0, 1, 2, 3, 4, 5, 6, 9)]
+
+
+def tem_dados_pessoais(texto, so_fortes=False):
+    """True se o texto tem dados pessoais mascarados. so_fortes: so os que identificam a pessoa
+    (CPF, PIS, RG, CTPS, CID, nascimento)."""
+    regras = _REGRAS_FORTES if so_fortes else _REGRAS_MASCARA
+    return bool(texto) and any(rx.search(texto) for rx, _ in regras)
+
+
+_RX_NUMERO_TERMO = re.compile(r"\d[\d.\-/\s]*\d|\d")
+
+
+def termo_tem_documento(termo):
+    """True se a busca parece um numero de documento pessoal: tem o formato de CPF, PIS, RG,
+    telefone etc., ou um numero com 10 ou mais digitos. Numeros comuns em databooks
+    (nota fiscal, contrato, norma, serie) continuam liberados."""
+    t = termo or ""
+    if tem_dados_pessoais(t.replace('"', " ")):
+        return True
+    return any(sum(c.isdigit() for c in m.group(0)) >= 10 for m in _RX_NUMERO_TERMO.finditer(t))
 
 
 # --------------------------------------------------------------------------
@@ -960,6 +1075,21 @@ class Indice:
 
     def empresas(self):
         return listar_empresas(self.raiz)
+
+    def modo_protecao(self, caminho, interno="", prot=None):
+        """Modo de protecao de um documento (considera o caminho e o nome dentro do .zip).
+        prot: Protecao ja montada (para varios documentos seguidos)."""
+        prot = prot if prot is not None else Protecao(self.regras_protecao())
+        if not prot:
+            return None
+        m1, m2 = prot.modo(self._rel(caminho)), (prot.modo(interno) if interno else None)
+        forca = {None: 0, MODO_RESTRITO: 1, MODO_SO_NOME: 2, MODO_IGNORAR: 3}
+        return m1 if forca[m1] >= forca[m2] else m2
+
+    def texto_documento(self, caminho, interno=""):
+        """Texto indexado de um documento (para conferir se tem dados pessoais antes de abrir)."""
+        return " ".join(t or "" for (t,) in self.con.execute(
+            "SELECT texto FROM conteudo WHERE caminho = ? AND interno = ?", (caminho, interno or "")))
 
     # ---- atualizacao incremental ----------------------------------------
 
@@ -1146,7 +1276,22 @@ class Indice:
         # usa a grafia da raiz gravada + o restante do caminho
         return raiz + prefixo[len(raiz):]
 
-    def buscar(self, termo: str, pasta: str = None, limite=2000):
+    def _filtro_pastas(self, pasta=None, pastas=None):
+        """SQL que limita a busca a uma pasta ou a uma lista de pastas (empresas liberadas).
+        pastas=[] (lista vazia) = nenhuma pasta liberada: nada e encontrado."""
+        lista = [pasta] if pasta else (list(pastas) if pastas is not None else None)
+        if lista is None:
+            return "", []
+        if not lista:
+            return " AND 0", []
+        conds, params = [], []
+        for p in lista:
+            pref = self._prefixo_seguro(p)
+            conds.append("substr(caminho, 1, ?) = ?")
+            params += [len(pref), pref]
+        return " AND (" + " OR ".join(conds) + ")", params
+
+    def buscar(self, termo: str, pasta: str = None, limite=2000, pastas=None):
         """
         Regras:
           trafo            -> palavras que comecam com "trafo" (trafo, trafos...)
@@ -1159,12 +1304,9 @@ class Indice:
         consulta = montar_consulta(termo)
         if not consulta:
             return []
-        filtro, params = "", [consulta]
-        if pasta:
-            prefixo = self._prefixo_seguro(pasta)
-            # comparacao exata de prefixo (LIKE trataria "_" de "DB_" como curinga)
-            filtro = " AND substr(caminho, 1, ?) = ?"
-            params += [len(prefixo), prefixo]
+        # comparacao exata de prefixo (LIKE trataria "_" de "DB_" como curinga)
+        filtro, extra = self._filtro_pastas(pasta, pastas)
+        params = [consulta] + extra
         params.append(limite)
         sql = f"""
             SELECT caminho, interno,
@@ -1198,7 +1340,7 @@ class Indice:
             r["mtime"], r["tamanho"] = meta.get(r["caminho"], (0.0, 0))
         return resultados
 
-    def buscar_nome(self, termo: str, pasta: str = None, limite=2000):
+    def buscar_nome(self, termo: str, pasta: str = None, limite=2000, pastas=None):
         """
         Busca SO pelo nome do arquivo (com extensao), ignorando o conteudo e as pastas.
         Vale para arquivos comuns e para arquivos dentro de .zip.
@@ -1207,11 +1349,8 @@ class Indice:
         grupos = _grupos_nome(termo)
         if not grupos:
             return []
-        filtro, params = "", []
-        if pasta:
-            prefixo = self._prefixo_seguro(pasta)
-            filtro = " WHERE substr(caminho, 1, ?) = ?"
-            params = [len(prefixo), prefixo]
+        cond, params = self._filtro_pastas(pasta, pastas)
+        filtro = (" WHERE 1" + cond) if cond else ""
         achados = {}
 
         # 1) arquivos comuns e o proprio .zip: tabela pequena (um registro por arquivo)
@@ -1224,7 +1363,7 @@ class Indice:
         consulta = montar_consulta(termo)
         if consulta:
             sql_zip = ("SELECT caminho, interno FROM conteudo WHERE conteudo MATCH ? AND interno <> ''"
-                       + (" AND substr(caminho, 1, ?) = ?" if pasta else "") + " LIMIT 20000")
+                       + cond + " LIMIT 20000")
             zips = [(c, i) for c, i in self.con.execute(sql_zip, [consulta] + params)
                     if _nome_casa(_nome_documento({"interno": i, "nome": ""}), grupos)]
             meta = self._meta_arquivos(c for c, _ in zips)
@@ -1835,6 +1974,17 @@ def _normalizar_codigo(codigo):
     return re.sub(r"[^A-Z0-9]", "", (codigo or "").upper())
 
 
+def _ler_empresas(valor):
+    """Coluna empresas do usuario: None (todas) ou lista de nomes."""
+    if valor is None:
+        return None
+    try:
+        lista = json.loads(valor)
+        return [str(e) for e in lista] if isinstance(lista, list) else None
+    except (ValueError, TypeError):
+        return []          # valor ilegivel: nega por seguranca (o administrador corrige)
+
+
 class Usuarios:
     """
     Usuarios locais deste computador. Senhas e codigos de recuperacao sao guardados so
@@ -1851,7 +2001,9 @@ class Usuarios:
         cols = {r[1] for r in self.con.execute("PRAGMA table_info(usuarios)")}
         for nome, tipo in (("provisoria", "INTEGER DEFAULT 0"), ("rec_sal", "BLOB"), ("rec_hash", "BLOB"),
                            ("iter", f"INTEGER DEFAULT {self.ITERACOES_ANTIGAS}"),
-                           ("rec_iter", f"INTEGER DEFAULT {self.ITERACOES_ANTIGAS}")):
+                           ("rec_iter", f"INTEGER DEFAULT {self.ITERACOES_ANTIGAS}"),
+                           # 3.7: acesso a dados pessoais completos e empresas liberadas (JSON; NULL = todas)
+                           ("acesso_completo", "INTEGER DEFAULT 0"), ("empresas", "TEXT")):
             if nome not in cols:
                 self.con.execute(f"ALTER TABLE usuarios ADD COLUMN {nome} {tipo}")
         self.con.commit()
@@ -1903,8 +2055,8 @@ class Usuarios:
     def validar(self, login, senha):
         """Devolve {login, admin, provisoria, tem_codigo} se a senha estiver certa; senao None."""
         login = login.strip().lower()
-        r = self.con.execute("SELECT sal, hash, admin, provisoria, rec_hash, iter FROM usuarios WHERE login=?",
-                             (login,)).fetchone()
+        r = self.con.execute("SELECT sal, hash, admin, provisoria, rec_hash, iter, acesso_completo, empresas "
+                             "FROM usuarios WHERE login=?", (login,)).fetchone()
         if r:
             it = self._conferir(senha, r[0], r[1], r[5])
             if it:
@@ -1913,7 +2065,11 @@ class Usuarios:
                     self.con.execute("UPDATE usuarios SET sal=?, hash=?, iter=? WHERE login=?",
                                      (sal, self._hash(senha, sal), self.ITERACOES, login))
                     self.con.commit()
-                return {"login": login, "admin": bool(r[2]), "provisoria": bool(r[3]), "tem_codigo": bool(r[4])}
+                admin = bool(r[2])
+                return {"login": login, "admin": admin, "provisoria": bool(r[3]), "tem_codigo": bool(r[4]),
+                        # administrador: sempre acesso completo e todas as empresas
+                        "acesso_completo": admin or bool(r[6]),
+                        "empresas": None if admin else _ler_empresas(r[7])}
         else:
             # mesmo custo de tempo para usuario inexistente (nao revela quais logins existem)
             self._hash(senha, b"\0" * 16, self.ITERACOES_ANTIGAS)
@@ -1924,6 +2080,23 @@ class Usuarios:
         """[(login, admin, provisoria)]"""
         return self.con.execute(
             "SELECT login, admin, COALESCE(provisoria, 0) FROM usuarios ORDER BY login").fetchall()
+
+    def permissoes(self, login):
+        """(admin, acesso_completo, empresas) do usuario. empresas: lista de nomes ou None (todas)."""
+        r = self.con.execute("SELECT admin, acesso_completo, empresas FROM usuarios WHERE login=?",
+                             (login,)).fetchone()
+        if not r:
+            raise ValueError("Usuário não encontrado.")
+        return bool(r[0]), bool(r[0]) or bool(r[1]), (None if r[0] else _ler_empresas(r[2]))
+
+    def definir_permissoes(self, login, acesso_completo, empresas):
+        """Administrador: libera (ou nao) dados pessoais completos e escolhe as empresas (None = todas)."""
+        if empresas is not None:
+            empresas = sorted({str(e).strip() for e in empresas if str(e).strip()}, key=str.casefold)
+        self.con.execute("UPDATE usuarios SET acesso_completo=?, empresas=? WHERE login=?",
+                         (int(bool(acesso_completo)),
+                          None if empresas is None else json.dumps(empresas, ensure_ascii=False), login))
+        self.con.commit()
 
     def remover(self, login):
         self.con.execute("DELETE FROM usuarios WHERE login=?", (login,))

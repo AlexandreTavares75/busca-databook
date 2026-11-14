@@ -229,11 +229,18 @@ def aplicar_icone(janela):
 
 def empresas_permitidas(usuario, empresas):
     """
-    Ponto unico de controle de acesso por empresa.
-    Hoje todos os usuarios veem todas as empresas. Para restringir no futuro,
-    filtre aqui a lista [(nome, caminho), ...] conforme o usuario.
+    Ponto unico de controle de acesso por empresa: filtra [(nome, caminho), ...] conforme o usuario.
+    usuario["empresas"] None = todas (administradores sempre); lista = so as empresas com esses nomes.
     """
-    return empresas
+    lib = usuario.get("empresas")
+    if lib is None:
+        return empresas
+    nomes = {n.casefold() for n in lib}
+    return [(n, c) for n, c in empresas if n.casefold() in nomes]
+
+
+MSG_SEM_ACESSO = ("Este documento contém dados pessoais.\n\nAbrir, baixar ou salvar cópia exige acesso a dados "
+                  "pessoais completos. Peça a liberação a um administrador do programa.")
 
 
 # --------------------------------------------------------------------------
@@ -625,26 +632,33 @@ class TelaRecuperar(tk.Toplevel):
 
 
 class TelaUsuarios(tk.Toplevel):
-    def __init__(self, master, usuarios, usuario_atual):
+    def __init__(self, master, usuarios, usuario_atual, empresas_nomes=()):
         super().__init__(master)
         self.usuarios = usuarios
         self.atual = usuario_atual
+        self.empresas_nomes = list(empresas_nomes)
         self.title("Usuários")
         self.resizable(False, False)
         f = ttk.Frame(self, padding=12)
         f.pack(fill="both", expand=True)
-        self.lista = ttk.Treeview(f, columns=("perfil", "situacao"), height=8)
+        self.lista = ttk.Treeview(f, columns=("perfil", "situacao", "dados", "empresas"), height=10)
         self.lista.heading("#0", text="Usuário")
         self.lista.heading("perfil", text="Perfil")
         self.lista.heading("situacao", text="Senha")
-        self.lista.column("#0", width=170)
-        self.lista.column("perfil", width=110)
+        self.lista.heading("dados", text="Dados pessoais")
+        self.lista.heading("empresas", text="Empresas")
+        self.lista.column("#0", width=160)
+        self.lista.column("perfil", width=105)
         self.lista.column("situacao", width=150)
-        self.lista.grid(row=0, column=0, rowspan=4, padx=(0, 8))
+        self.lista.column("dados", width=110)
+        self.lista.column("empresas", width=120)
+        self.lista.grid(row=0, column=0, rowspan=5, padx=(0, 8))
+        self.lista.bind("<Double-1>", lambda e: self.permissoes())
         ttk.Button(f, text="Novo usuário", command=self.novo).grid(row=0, column=1, sticky="ew", pady=2)
-        ttk.Button(f, text="Redefinir senha", command=self.redefinir).grid(row=1, column=1, sticky="ew", pady=2)
-        ttk.Button(f, text="Excluir", command=self.excluir).grid(row=2, column=1, sticky="ew", pady=2)
-        ttk.Button(f, text="Fechar", command=self.destroy).grid(row=3, column=1, sticky="sew", pady=2)
+        ttk.Button(f, text="Permissões...", command=self.permissoes).grid(row=1, column=1, sticky="ew", pady=2)
+        ttk.Button(f, text="Redefinir senha", command=self.redefinir).grid(row=2, column=1, sticky="ew", pady=2)
+        ttk.Button(f, text="Excluir", command=self.excluir).grid(row=3, column=1, sticky="ew", pady=2)
+        ttk.Button(f, text="Fechar", command=self.destroy).grid(row=4, column=1, sticky="sew", pady=2)
         self.recarregar()
         self.transient(master)
         self.grab_set()
@@ -652,9 +666,12 @@ class TelaUsuarios(tk.Toplevel):
     def recarregar(self):
         self.lista.delete(*self.lista.get_children())
         for login, admin, provisoria in self.usuarios.listar():
+            _, completo, emp = self.usuarios.permissoes(login)
             self.lista.insert("", "end", iid=login, text=login,
                               values=("Administrador" if admin else "Usuário",
-                                      "provisória (trocar no acesso)" if provisoria else "definida pelo usuário"))
+                                      "provisória (trocar no acesso)" if provisoria else "definida pelo usuário",
+                                      "completos" if completo else "mascarados",
+                                      "todas" if emp is None else (f"{len(emp)} liberada(s)" if emp else "nenhuma")))
 
     def selecionado(self):
         s = self.lista.selection()
@@ -700,6 +717,30 @@ class TelaUsuarios(tk.Toplevel):
         core.auditar(self.atual, "senha redefinida (provisória)", s)
         self.recarregar()
         self._mostrar_provisoria(s, senha)
+
+    def permissoes(self):
+        s = self.selecionado()
+        if not s:
+            messagebox.showinfo("Usuários", "Selecione um usuário na lista.", parent=self)
+            return
+        admin, completo, emp = self.usuarios.permissoes(s)
+        if admin:
+            messagebox.showinfo("Usuários", f"“{s}” é administrador: sempre tem acesso completo aos dados "
+                                            "pessoais e a todas as empresas.", parent=self)
+            return
+        tela = TelaPermissoes(self, s, completo, emp, self.empresas_nomes)
+        self.wait_window(tela)
+        if tela.resultado is None:
+            return
+        novo_completo, novas = tela.resultado
+        self.usuarios.definir_permissoes(s, novo_completo, novas)
+        core.auditar(self.atual, "permissões alteradas",
+                     f"{s}: dados pessoais {'completos' if novo_completo else 'mascarados'}; empresas: "
+                     + ("todas" if novas is None else (", ".join(novas) or "nenhuma")))
+        self.recarregar()
+        self.lista.selection_set(s)
+        messagebox.showinfo("Usuários", f"Permissões de “{s}” salvas. Valem a partir do próximo login dele.",
+                            parent=self)
 
     def excluir(self):
         s = self.selecionado()
@@ -775,6 +816,70 @@ class TelaExportar(tk.Toplevel):
             self.resultado = (None, True)                       # indice inteiro
         else:
             self.resultado = ([self.empresas[i][1] for i in sel], fora)
+        self.destroy()
+
+
+class TelaPermissoes(tk.Toplevel):
+    """Permissoes de um usuario comum. resultado = (acesso_completo, empresas ou None) ou None."""
+
+    def __init__(self, master, login, completo, empresas, nomes_disponiveis):
+        super().__init__(master)
+        self.resultado = None
+        self.title(f"Permissões de {login}")
+        self.resizable(False, False)
+        f = ttk.Frame(self, padding=14)
+        f.pack(fill="both", expand=True)
+        self.var_completo = tk.BooleanVar(value=completo)
+        ttk.Checkbutton(f, text="Acesso a dados pessoais completos", variable=self.var_completo).grid(
+            row=0, column=0, sticky="w")
+        ttk.Label(f, foreground="#555", wraplength=430, justify="left", text=(
+            "Com acesso completo: vê CPF, RG, PIS, CID, telefone, endereço, nascimento e salário sem máscara, "
+            "busca por número de documento, acha documentos restritos (ex.: ASO) pelo conteúdo e pode abrir "
+            "e salvar cópia de documentos com dados pessoais. Ex.: o advogado responsável pela defesa.\n"
+            "Sem acesso completo: vê os resultados com os dados mascarados e não abre nem baixa esses documentos.")
+                  ).grid(row=1, column=0, sticky="w", pady=(2, 12))
+        # empresas: os nomes conhecidos (da pasta atual) + os que ja estavam liberados
+        nomes = sorted(set(nomes_disponiveis) | set(empresas or []), key=str.casefold)
+        self.nomes = nomes
+        self.var_todas = tk.BooleanVar(value=empresas is None)
+        ttk.Checkbutton(f, text="Todas as empresas (inclusive as que forem criadas depois)", variable=self.var_todas,
+                        command=self._todas_mudou).grid(row=2, column=0, sticky="w")
+        caixa = ttk.Frame(f)
+        caixa.grid(row=3, column=0, sticky="ew", pady=(4, 0))
+        self.lista = tk.Listbox(caixa, selectmode="multiple", height=min(12, max(4, len(nomes))), width=50,
+                                exportselection=False, activestyle="none")
+        sb = ttk.Scrollbar(caixa, orient="vertical", command=self.lista.yview)
+        self.lista.configure(yscrollcommand=sb.set)
+        self.lista.pack(side="left", fill="both", expand=True)
+        sb.pack(side="right", fill="y")
+        marcadas = {e.casefold() for e in (empresas or [])}
+        for i, n in enumerate(nomes):
+            self.lista.insert("end", n)
+            if n.casefold() in marcadas:
+                self.lista.select_set(i)
+        if not nomes:
+            ttk.Label(f, foreground="#a0522d", text="Abra a pasta principal para ver a lista de empresas.").grid(
+                row=4, column=0, sticky="w")
+        ttk.Label(f, foreground="#555", wraplength=430, justify="left",
+                  text="Com empresas escolhidas, o usuário só vê e busca nelas (arquivos fora das pastas "
+                       "“DB_” também ficam ocultos).").grid(row=5, column=0, sticky="w", pady=(6, 0))
+        b = ttk.Frame(f)
+        b.grid(row=6, column=0, sticky="e", pady=(12, 0))
+        ttk.Button(b, text="Salvar", command=self._salvar).pack(side="left", padx=4)
+        ttk.Button(b, text="Cancelar", command=self.destroy).pack(side="left")
+        self._todas_mudou()
+        self.transient(master)
+        self.grab_set()
+
+    def _todas_mudou(self):
+        self.lista.config(state="disabled" if self.var_todas.get() else "normal")
+
+    def _salvar(self):
+        empresas = None if self.var_todas.get() else [self.nomes[i] for i in self.lista.curselection()]
+        if empresas == [] and not messagebox.askyesno(
+                self.title(), "Nenhuma empresa marcada: o usuário não verá nenhum resultado. Continuar?", parent=self):
+            return
+        self.resultado = (self.var_completo.get(), empresas)
         self.destroy()
 
 
@@ -875,6 +980,9 @@ class TelaProtecao(tk.Toplevel):
             "Pastas ou arquivos cujo caminho contém um destes termos (palavra inteira, sem diferenciar "
             "acentos e maiúsculas) recebem proteção especial. Use para documentos com dados pessoais "
             "sensíveis, como atestados de saúde (ASO) e exames.\n\n"
+            "• Restrito: o conteúdo é lido e pode ser usado (ex.: defesa em processo trabalhista), mas só "
+            "quem tem acesso a dados pessoais completos acha pelo conteúdo, vê o trecho e abre o arquivo. "
+            "Os demais acham só pelo nome.\n"
             "• Só o nome: o arquivo aparece na busca pelo nome, mas o conteúdo não é lido.\n"
             "• Ignorar: o arquivo não entra no índice.\n\n"
             "As regras valem para esta pasta principal e viajam junto com o índice exportado ou o "
@@ -883,22 +991,22 @@ class TelaProtecao(tk.Toplevel):
         self.tv.heading("#0", text="Termo")
         self.tv.heading("modo", text="Proteção")
         self.tv.column("#0", width=230)
-        self.tv.column("modo", width=300)
+        self.tv.column("modo", width=330)
         self.tv.grid(row=1, column=0, columnspan=4, sticky="ew", pady=(10, 4))
         self.var_termo = tk.StringVar()
         ttk.Entry(f, textvariable=self.var_termo, width=28).grid(row=2, column=0, sticky="w")
-        self.var_modo = tk.StringVar(value=core.MODOS_PROTECAO[core.MODO_SO_NOME])
-        ttk.Combobox(f, textvariable=self.var_modo, state="readonly", width=32,
+        self.var_modo = tk.StringVar(value=core.MODOS_PROTECAO[core.MODO_RESTRITO])
+        ttk.Combobox(f, textvariable=self.var_modo, state="readonly", width=40,
                      values=list(core.MODOS_PROTECAO.values())).grid(row=2, column=1, sticky="w", padx=6)
         ttk.Button(f, text="Adicionar", command=self._adicionar).grid(row=2, column=2, sticky="w")
         ttk.Button(f, text="Remover selecionadas", command=self._remover).grid(row=2, column=3, sticky="e")
-        ttk.Label(f, text="Sugestões (clique para adicionar como “Só o nome”):").grid(
+        ttk.Label(f, text="Sugestões (clique para adicionar como “Restrito”):").grid(
             row=3, column=0, columnspan=4, sticky="w", pady=(10, 2))
         sug = ttk.Frame(f)
         sug.grid(row=4, column=0, columnspan=4, sticky="w")
         for i, t in enumerate(core.SUGESTOES_PROTECAO):
             ttk.Button(sug, text=t, width=len(t) + 2,
-                       command=lambda t=t: self._incluir(t, core.MODO_SO_NOME)).grid(row=i // 7, column=i % 7,
+                       command=lambda t=t: self._incluir(t, core.MODO_RESTRITO)).grid(row=i // 7, column=i % 7,
                                                                                     padx=2, pady=2, sticky="w")
         b = ttk.Frame(f)
         b.grid(row=5, column=0, columnspan=4, sticky="e", pady=(12, 0))
@@ -1046,7 +1154,9 @@ QUEM RESPONDE PELOS DADOS
 BOAS PRÁTICAS
 • Cada pessoa com a sua própria conta do Windows e do programa. Nunca compartilhe senhas.
 • Mantenha a criptografia de disco do Windows (BitLocker) ligada: o login do programa protege as telas, mas o índice fica gravado na pasta acima.
-• Em Opções > Proteção de dados pessoais, marque pastas como ASO e exames para que o conteúdo não seja lido.
+• Quem não tem acesso a dados pessoais completos vê CPF, RG, PIS, CTPS, CID, telefone, endereço, data de nascimento e salário mascarados (CPF no padrão do governo: ***.456.789-**), não busca por número de documento e não abre nem baixa documentos com esses dados. O acesso completo é liberado pelos administradores em Usuários > Permissões (ex.: para o advogado responsável pela defesa).
+• Em Opções > Proteção de dados pessoais, marque pastas como ASO e exames como “Restrito”: o conteúdo continua disponível para quem tem acesso completo, e os demais só acham o arquivo pelo nome.
+• A máscara vale para o que o programa mostra. O acesso direto às pastas da rede é controlado pelas permissões da própria empresa.
 • A sessão é bloqueada após um tempo sem uso (Opções > Bloquear após inatividade).
 • Ao fim do uso ou do contrato: Arquivo > Eliminar dados.
 
@@ -1486,7 +1596,9 @@ class App:
         conta.add_command(label="Gerar novo código de recuperação", command=self.novo_codigo)
         m.add_cascade(label="Minha conta", menu=conta)
         if self.usuario["admin"]:
-            m.add_command(label="Usuários", command=lambda: TelaUsuarios(self.root, self.usuarios, self.usuario["login"]))
+            m.add_command(label="Usuários", command=lambda: TelaUsuarios(
+                self.root, self.usuarios, self.usuario["login"],
+                [n for n, _ in (self.indice_busca.empresas() if self.indice_busca else [])]))
         aj = tk.Menu(m, tearoff=0)
         aj.add_command(label="Como buscar", command=lambda: messagebox.showinfo("Como buscar", DICAS))
         aj.add_command(label="Verificar atualizações", command=lambda: self._verificar_atualizacao(manual=True))
@@ -1617,6 +1729,7 @@ class App:
     def _carregar_empresas(self, manter=False):
         anterior = self.empresa if manter else None
         empresas = empresas_permitidas(self.usuario, self.indice_busca.empresas()) if self.indice_busca else []
+        self.empresas_liberadas = empresas
         self.menu_emp.carregar(empresas)
         nomes = {c: n for n, c in empresas}
         self.empresa = anterior if anterior in nomes else None
@@ -2392,16 +2505,66 @@ class App:
             if messagebox.askyesno(APP_NOME, "A pasta ainda não foi indexada. Indexar agora?"):
                 self.atualizar_indice()
             return
+        if core.termo_tem_documento(termo):
+            if not self.usuario.get("acesso_completo"):
+                messagebox.showinfo(APP_NOME, "Busca por número de documento pessoal (CPF, RG, PIS, telefone...) "
+                                              "é permitida só para quem tem acesso a dados pessoais completos.\n\n"
+                                              "Busque pelo nome da pessoa: os documentos aparecem com os dados "
+                                              "mascarados.")
+                self.resultados = []
+                self._mostrar_resultados()
+                return
+            core.auditar(self.usuario["login"], "busca por número de documento pessoal")   # sem o numero
+        # empresa escolhida no menu; em "Todas", so as empresas liberadas para o usuario
+        pastas = None
+        if not self.empresa and self.usuario.get("empresas") is not None:
+            pastas = [c for _, c in getattr(self, "empresas_liberadas", [])]
         try:
             if self.var_modo.get() == "nome":
-                self.resultados = self.indice_busca.buscar_nome(termo, pasta=self.empresa)
+                res = self.indice_busca.buscar_nome(termo, pasta=self.empresa, pastas=pastas)
             else:
-                self.resultados = self.indice_busca.buscar(termo, pasta=self.empresa)
+                res = self.indice_busca.buscar(termo, pasta=self.empresa, pastas=pastas)
+            self.resultados = self._aplicar_privacidade(res)
         except Exception as e:
             log.exception("Erro na busca")
             messagebox.showerror(APP_NOME, f"Não foi possível buscar: {e}")
             return
         self._mostrar_resultados()
+
+    def _aplicar_privacidade(self, resultados):
+        """Sem acesso completo: mascara os trechos e esconde o que foi achado pelo conteudo de documentos
+        restritos (achar "hipertensão" num ASO ja revelaria o dado de saude)."""
+        if self.usuario.get("acesso_completo"):
+            return resultados
+        saida = []
+        prot = core.Protecao(self.indice_busca.regras_protecao())
+        for r in resultados:
+            if self.indice_busca.modo_protecao(r["caminho"], r["interno"], prot) == core.MODO_RESTRITO:
+                if r["onde"] == "conteúdo":
+                    continue
+                r["trecho"] = "(conteúdo restrito)" if r["trecho"] else ""
+            else:
+                r["trecho"] = core.mascarar(r["trecho"])
+            saida.append(r)
+        return saida
+
+    def _acesso_documento(self, r):
+        """(True, "") se o usuario pode abrir/baixar o documento; senao (False, motivo)."""
+        if not self.indice_busca or not self.indice_busca.contem(r["caminho"]):
+            return False, "fora da pasta principal"
+        if self.usuario.get("empresas") is not None:
+            raizes = [os.path.join(c, "") for _, c in getattr(self, "empresas_liberadas", [])]
+            alvo = os.path.normcase(r["caminho"])
+            if not any(alvo.startswith(os.path.normcase(x)) for x in raizes):
+                return False, "empresa não liberada para o seu usuário"
+        if not self.usuario.get("acesso_completo"):
+            if (self.indice_busca.modo_protecao(r["caminho"], r["interno"]) == core.MODO_RESTRITO
+                    or core.tem_dados_pessoais(self.indice_busca.texto_documento(r["caminho"], r["interno"]),
+                                               so_fortes=True)):
+                core.auditar(self.usuario["login"], "acesso negado a documento com dados pessoais",
+                             os.path.basename(r["caminho"]))
+                return False, "dados pessoais"
+        return True, ""
 
     def limpar_busca(self):
         self.var_termo.set("")
@@ -2445,6 +2608,8 @@ class App:
             visiveis = len(self.exibidos)
             txt = (f"{visiveis} resultado(s) para “{termo}” em {onde}." if visiveis
                    else f"Nada encontrado para “{termo}” em {onde}.")
+            if not self.usuario.get("acesso_completo"):
+                txt += " Dados pessoais mascarados."
             ocultos = len(base) - visiveis
             if ocultos:
                 txt += f" {ocultos} cópia(s)/versão(ões) antiga(s) ocultas."
@@ -2472,10 +2637,17 @@ class App:
             self.menu_ctx.tk_popup(ev.x_root, ev.y_root)
 
     def _permitido(self, r):
-        """So abre arquivos de dentro da pasta principal (protege contra indices adulterados)."""
-        if self.indice_busca and self.indice_busca.contem(r["caminho"]):
+        """So abre arquivos da pasta principal, das empresas liberadas e, sem acesso completo,
+        sem dados pessoais."""
+        ok, motivo = self._acesso_documento(r)
+        if ok:
             return True
-        messagebox.showwarning(APP_NOME, f"Por segurança, só são abertos arquivos da pasta principal:\n{r['caminho']}")
+        if motivo == "dados pessoais":
+            messagebox.showwarning(APP_NOME, MSG_SEM_ACESSO)
+        elif motivo == "fora da pasta principal":
+            messagebox.showwarning(APP_NOME, f"Por segurança, só são abertos arquivos da pasta principal:\n{r['caminho']}")
+        else:
+            messagebox.showwarning(APP_NOME, f"Sem permissão para este arquivo ({motivo}).")
         return False
 
     def abrir(self, itens=None):
@@ -2523,8 +2695,10 @@ class App:
         self._salvar_cfg()
         ok, falhas = 0, []
         for r in sel:
-            if not self.indice_busca or not self.indice_busca.contem(r["caminho"]):
-                falhas.append(f"{r['nome']}: fora da pasta principal")
+            pode, motivo = self._acesso_documento(r)
+            if not pode:
+                falhas.append(f"{r['nome']}: " + ("contém dados pessoais (exige acesso completo)"
+                                                  if motivo == "dados pessoais" else motivo))
                 continue
             try:
                 if r["interno"]:

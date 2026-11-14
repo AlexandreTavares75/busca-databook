@@ -11,7 +11,7 @@ O GitHub Actions confere se a tag bate com este arquivo antes de gerar o instala
 """
 
 APP_NOME = "Busca Databook"
-VERSAO = "3.6.1"
+VERSAO = "3.7.0"
 REPO_GITHUB = "AlexandreTavares75/busca-databook"
 
 # Chave PUBLICA (Ed25519, base64) que confere a assinatura das atualizacoes.

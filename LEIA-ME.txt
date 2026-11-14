@@ -1,10 +1,32 @@
-BUSCA DATABOOK 3.6
+BUSCA DATABOOK 3.7
 ==================
 
 Programa para Windows que procura uma palavra (ex.: "Trafo") dentro dos
 documentos de uma pasta e de todas as suas subpastas: no PC, na rede
 (ex.: \\servidor\projetos ou uma unidade mapeada) ou na nuvem sincronizada
 (OneDrive, Google Drive para computador, SharePoint sincronizado).
+
+
+NOVIDADES DA 3.7 (PERMISSÕES E MÁSCARA DE DADOS PESSOAIS)
+--------------------------------------------------------
+- Máscara de dados pessoais para quem não tem acesso completo: CPF no
+  padrão do governo (***.456.789-**), PIS/NIT, RG, CTPS, CID, telefone,
+  data de nascimento, endereço e salário aparecem mascarados nos trechos.
+  O índice continua com o texto completo (necessário para a defesa em
+  processos trabalhistas).
+- Sem acesso completo: não busca por número de documento pessoal e não
+  abre, não abre a pasta e não salva cópia de documentos com CPF, PIS, RG,
+  CTPS, CID ou data de nascimento. Documentos técnicos abrem normalmente.
+- Usuários > Permissões (administradores): "Acesso a dados pessoais
+  completos" (ex.: para o advogado da defesa) e as empresas que cada
+  usuário pode ver. Administradores sempre têm acesso a tudo.
+- Proteção de dados pessoais ganhou o modo "Restrito" (o sugerido para
+  ASO e exames): o conteúdo é indexado, mas só quem tem acesso completo
+  acha pelo conteúdo, vê o trecho e abre; os demais acham só pelo nome.
+- Auditoria registra as permissões alteradas, as buscas por número de
+  documento (sem o número) e os acessos negados.
+- A máscara vale para o que o programa mostra. O acesso direto às pastas
+  da rede continua dependendo das permissões da própria empresa.
 
 
 NOVIDADES DA 3.6 (PROTEÇÃO DE DADOS - LGPD)

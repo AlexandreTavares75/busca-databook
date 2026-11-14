@@ -1860,6 +1860,15 @@ class Usuarios:
     def _hash(cls, senha, sal, iteracoes=None):
         return hashlib.pbkdf2_hmac("sha256", senha.encode("utf-8"), sal, iteracoes or cls.ITERACOES)
 
+    def _conferir(self, segredo, sal, guardado, iteracoes):
+        """Confere a senha/codigo. Devolve o numero de iteracoes que bateu, ou None.
+        Tenta tambem o custo antigo: uma versao anterior do programa (ate a 3.5) pode ter gravado
+        o hash com 200 mil iteracoes sem atualizar a coluna (ex.: senha recuperada na 3.5)."""
+        for it in dict.fromkeys((iteracoes or self.ITERACOES_ANTIGAS, self.ITERACOES_ANTIGAS, self.ITERACOES)):
+            if hmac.compare_digest(self._hash(segredo, sal, it), guardado):
+                return it
+        return None
+
     @staticmethod
     def _checar_senha(senha, login=""):
         faltam = problemas_senha(senha, login)
@@ -1897,8 +1906,9 @@ class Usuarios:
         r = self.con.execute("SELECT sal, hash, admin, provisoria, rec_hash, iter FROM usuarios WHERE login=?",
                              (login,)).fetchone()
         if r:
-            if hmac.compare_digest(self._hash(senha, r[0], r[5]), r[1]):
-                if (r[5] or 0) < self.ITERACOES:          # hash antigo: refaz com o custo atual
+            it = self._conferir(senha, r[0], r[1], r[5])
+            if it:
+                if it < self.ITERACOES or r[5] != it:     # hash antigo: refaz com o custo atual
                     sal = os.urandom(16)
                     self.con.execute("UPDATE usuarios SET sal=?, hash=?, iter=? WHERE login=?",
                                      (sal, self._hash(senha, sal), self.ITERACOES, login))
@@ -1906,6 +1916,7 @@ class Usuarios:
                 return {"login": login, "admin": bool(r[2]), "provisoria": bool(r[3]), "tem_codigo": bool(r[4])}
         else:
             # mesmo custo de tempo para usuario inexistente (nao revela quais logins existem)
+            self._hash(senha, b"\0" * 16, self.ITERACOES_ANTIGAS)
             self._hash(senha, b"\0" * 16)
         return None
 
@@ -1958,7 +1969,7 @@ class Usuarios:
         if not r or not r[0] or not r[1]:
             self._hash(cod, b"\0" * 16)          # mesmo custo de tempo: nao revela se o usuario existe
             return None
-        if len(cod) != TAM_CODIGO or not hmac.compare_digest(self._hash(cod, r[0], r[2]), r[1]):
+        if len(cod) != TAM_CODIGO or not self._conferir(cod, r[0], r[1], r[2]):
             return None
         self.trocar_senha(login, nova, provisoria=False)
         return self.gerar_codigo(login)

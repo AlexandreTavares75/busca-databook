@@ -30,6 +30,8 @@ NOVIDADES DA 3.6 (PROTEÇÃO DE DADOS - LGPD)
   existentes são reforçadas sozinhas no próximo login, sem troca.
 - Ajuda > Privacidade e proteção de dados: o que o programa guarda, o que
   sai do computador e boas práticas.
+- 3.6.1: corrige o login de quem trocou ou recuperou a senha numa versão
+  anterior (3.5) depois de já ter usado a 3.6.
 
 
 NOVIDADES DA 3.5
